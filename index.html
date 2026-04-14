@@ -17,6 +17,20 @@
     padding:8px 12px; font-size:13px; border-radius:6px; cursor:pointer;
     -webkit-tap-highlight-color:transparent; }
   button:active { background:#333; }
+  #panel { position:fixed; bottom:8px; left:8px; right:8px; z-index:10;
+    background:#0a0a0aee; border:1px solid #333; border-radius:8px;
+    padding:10px 12px; font-size:12px; max-height:50vh; overflow-y:auto;
+    transition: max-height 0.2s; }
+  #panel.collapsed { max-height: 28px; overflow:hidden; padding:6px 12px; }
+  #panelHdr { display:flex; justify-content:space-between; align-items:center;
+    cursor:pointer; user-select:none; font-weight:bold; }
+  .row { display:grid; grid-template-columns: 90px 1fr 56px; gap:8px;
+    align-items:center; margin-top:6px; }
+  .row label { opacity:0.85; }
+  .row input[type=range] { width:100%; }
+  .row .val { text-align:right; font-variant-numeric: tabular-nums; opacity:0.9; }
+  .row select { width:100%; background:#1a1a1a; color:#fff; border:1px solid #333;
+    padding:4px; border-radius:4px; font-size:12px; }
   #err { position:fixed; inset:0; display:none; align-items:center;
     justify-content:center; padding:20px; background:#200; color:#fcc;
     font-size:14px; text-align:center; z-index:99; }
@@ -24,11 +38,67 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.4<br><span id="fps">--</span> fps</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.5<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
   <button id="motion">Enable motion</button>
+</div>
+<div id="panel" class="">
+  <div id="panelHdr"><span>Tuning</span><span id="panelToggle">▼</span></div>
+  <div id="panelBody">
+    <div class="row">
+      <label>particles</label>
+      <select id="s_count">
+        <option value="32">1,024 (32²)</option>
+        <option value="64">4,096 (64²)</option>
+        <option value="128" selected>16,384 (128²)</option>
+        <option value="192">36,864 (192²)</option>
+        <option value="256">65,536 (256²)</option>
+      </select>
+      <span class="val" id="v_count">128²</span>
+    </div>
+    <div class="row">
+      <label>splat px</label>
+      <input id="s_splat" type="range" min="2" max="28" step="1" value="10">
+      <span class="val" id="v_splat">10</span>
+    </div>
+    <div class="row">
+      <label>rest density</label>
+      <input id="s_rest" type="range" min="1" max="80" step="0.5" value="22">
+      <span class="val" id="v_rest">22</span>
+    </div>
+    <div class="row">
+      <label>stiffness</label>
+      <input id="s_stiff" type="range" min="0.05" max="4" step="0.05" value="0.6">
+      <span class="val" id="v_stiff">0.60</span>
+    </div>
+    <div class="row">
+      <label>viscosity</label>
+      <input id="s_xsph" type="range" min="0" max="0.5" step="0.01" value="0.12">
+      <span class="val" id="v_xsph">0.12</span>
+    </div>
+    <div class="row">
+      <label>damping</label>
+      <input id="s_damp" type="range" min="0.95" max="1" step="0.001" value="0.997">
+      <span class="val" id="v_damp">0.997</span>
+    </div>
+    <div class="row">
+      <label>gravity</label>
+      <input id="s_grav" type="range" min="0" max="4" step="0.05" value="1.4">
+      <span class="val" id="v_grav">1.40</span>
+    </div>
+    <div class="row">
+      <label>show fluid</label>
+      <input id="s_blob" type="range" min="0" max="1" step="1" value="1">
+      <span class="val" id="v_blob">on</span>
+    </div>
+    <div class="row">
+      <label>show pts</label>
+      <input id="s_pts" type="range" min="0" max="1" step="1" value="1">
+      <span class="val" id="v_pts">on</span>
+    </div>
+  </div>
 </div>
 <div id="err"></div>
 <script id="main">
@@ -297,6 +367,7 @@ uniform sampler2D u_collision;
 uniform sampler2D u_density;
 uniform vec2 u_aspect;
 uniform float u_rest;
+uniform float u_blobAlpha;
 out vec4 outColor;
 void main() {
   vec2 p = (v_uv * 2.0 - 1.0) / u_aspect;
@@ -304,8 +375,7 @@ void main() {
   vec2 simUV = p * 0.5 + 0.5;
   float d = texture(u_density, simUV).r;
   float m = texture(u_collision, simUV).r;
-  // Fluid surface: smoothstep around half rest density.
-  float surf = smoothstep(u_rest * 0.25, u_rest * 1.0, d);
+  float surf = smoothstep(u_rest * 0.25, u_rest * 1.0, d) * u_blobAlpha;
   vec3 deep    = vec3(0.04, 0.16, 0.40);
   vec3 surface = vec3(0.30, 0.65, 1.00);
   vec3 fluid = mix(deep, surface, smoothstep(u_rest * 0.5, u_rest * 2.0, d));
@@ -458,6 +528,38 @@ S.resetParticles = function () {
   }
 };
 
+// helper: rebuild state textures + index VAO at a different N_SIDE.
+// Free old GL objects so we don't leak across changes.
+S.setParticleCount = function (newSide) {
+  if (newSide === S.N_SIDE) return;
+  // Drop old textures / FBOs / VAO
+  for (let i = 0; i < 2; i++) {
+    gl.deleteTexture(S.stateTex[i]);
+    gl.deleteFramebuffer(S.stateFBO[i]);
+  }
+  if (S.idxVAO) gl.deleteVertexArray(S.idxVAO);
+
+  S.N_SIDE = newSide;
+  S.N = newSide * newSide;
+  const init = initialState();
+  S.stateTex = [
+    makeTex(S.N_SIDE, S.N_SIDE, gl.RGBA32F, gl.RGBA, gl.FLOAT, init),
+    makeTex(S.N_SIDE, S.N_SIDE, gl.RGBA32F, gl.RGBA, gl.FLOAT, init),
+  ];
+  S.stateFBO = [makeFBO(S.stateTex[0]), makeFBO(S.stateTex[1])];
+
+  S.idxVAO = gl.createVertexArray();
+  gl.bindVertexArray(S.idxVAO);
+  const idx = new Float32Array(S.N);
+  for (let i = 0; i < S.N; i++) idx[i] = i;
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+};
+
 // helper: clear collision
 S.clearCollision = function () {
   gl.bindFramebuffer(gl.FRAMEBUFFER, S.collisionFBO);
@@ -518,8 +620,47 @@ S.canvas.addEventListener('pointercancel', endPaint);
 document.getElementById('reset').addEventListener('click', () => S.resetParticles());
 document.getElementById('clearC').addEventListener('click', () => S.clearCollision());
 
+// ----- Tuning panel -----
+const panel = document.getElementById('panel');
+document.getElementById('panelHdr').addEventListener('click', () => {
+  panel.classList.toggle('collapsed');
+  document.getElementById('panelToggle').textContent =
+    panel.classList.contains('collapsed') ? '▲' : '▼';
+});
+function bindSlider(id, valId, prop, fmt) {
+  const el = document.getElementById(id);
+  const v  = document.getElementById(valId);
+  const apply = () => {
+    const x = parseFloat(el.value);
+    PR[prop] = x;
+    v.textContent = fmt ? fmt(x) : x.toFixed(2);
+  };
+  el.addEventListener('input', apply);
+  apply();
+}
+bindSlider('s_splat', 'v_splat', 'splatPt',  (x) => x.toFixed(0));
+bindSlider('s_rest',  'v_rest',  'rest',     (x) => x.toFixed(1));
+bindSlider('s_stiff', 'v_stiff', 'stiff',    (x) => x.toFixed(2));
+bindSlider('s_xsph',  'v_xsph',  'xsph',     (x) => x.toFixed(2));
+bindSlider('s_damp',  'v_damp',  'damping',  (x) => x.toFixed(3));
+bindSlider('s_grav',  'v_grav',  'gravity',  (x) => x.toFixed(2));
+bindSlider('s_blob',  'v_blob',  'showBlob', (x) => x ? 'on' : 'off');
+bindSlider('s_pts',   'v_pts',   'showPts',  (x) => x ? 'on' : 'off');
+
+const countSel = document.getElementById('s_count');
+const countVal = document.getElementById('v_count');
+function applyCount() {
+  const n = parseInt(countSel.value, 10);
+  S.setParticleCount(n);
+  countVal.textContent = n + '²';
+  document.getElementById('np').textContent = (n*n).toLocaleString();
+}
+countSel.addEventListener('change', applyCount);
+applyCount();
+
 // ----- Motion / gravity -----
-let gx = 0, gy = -1.4;          // default downward gravity (sim units / s^2 ish)
+// gx/gy are computed in step() each frame from gMotionX/Y * PR.gravity.
+let gx = 0, gy = 0;
 let lastMotionTs = 0;
 function onMotion(e) {
   const a = e.accelerationIncludingGravity;
@@ -533,11 +674,13 @@ function onMotion(e) {
   const c = Math.cos(angle), s = Math.sin(angle);
   const rx =  c * ax + s * ay;
   const ry = -s * ax + c * ay;
-  // Scale m/s^2 (~9.8) down to a sim-friendly value.
-  const k = 0.16;
-  gx = rx * k;
-  gy = ry * k;
+  // Normalize device acceleration to a unit gravity vector, then scale
+  // by the user's gravity slider in the main loop.
+  const k = 1 / 9.81;
+  gMotionX = rx * k;
+  gMotionY = ry * k;
 }
+let gMotionX = 0, gMotionY = -1;
 const motionBtn = document.getElementById('motion');
 motionBtn.addEventListener('click', async () => {
   try {
@@ -567,15 +710,19 @@ function updateAspect() {
 }
 
 let cur = 0; // ping-pong index
-// Tuned for SPLAT_PT=10 on a 128 grid: ~23 density per cell at uniform fill.
-// REST near that average means most of the fluid sits at modest pressure;
-// STIFF kept low because the gradient denominator h=1/128 already amplifies
-// values by ~64x.
-const SPLAT_PT = 10.0;     // particle splat size in grid pixels
-const REST     = 22.0;     // rest density (target avg per cell)
-const STIFF    = 0.6;      // pressure stiffness
-const XSPH     = 0.12;     // viscosity blend per substep (0..1)
-const DAMPING  = 0.997;
+// Live-tunable params. Bound to sliders in the panel UI; defaults match
+// the slider initial values in HTML.
+S.params = {
+  splatPt: 10.0,
+  rest:    22.0,
+  stiff:   0.6,
+  xsph:    0.12,
+  damping: 0.997,
+  gravity: 1.4,
+  showBlob: 1,
+  showPts:  1,
+};
+const PR = S.params;
 
 function splatScalarField(prog, fbo) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -589,13 +736,17 @@ function splatScalarField(prog, fbo) {
   gl.bindTexture(gl.TEXTURE_2D, S.stateTex[cur]);
   gl.uniform1i(prog.U('u_state'), 0);
   gl.uniform1f(prog.U('u_nside'), S.N_SIDE);
-  gl.uniform1f(prog.U('u_pointSize'), SPLAT_PT);
+  gl.uniform1f(prog.U('u_pointSize'), PR.splatPt);
   gl.bindVertexArray(S.idxVAO);
   gl.drawArrays(gl.POINTS, 0, S.N);
   gl.disable(gl.BLEND);
 }
 
 function step(dt) {
+  // Refresh gravity from motion vector + slider (or fall back to down).
+  gx = gMotionX * PR.gravity;
+  gy = gMotionY * PR.gravity;
+
   // 1) Splat density
   splatScalarField(P.splat, S.densityFBO);
 
@@ -619,10 +770,10 @@ function step(dt) {
   gl.uniform2f(P.update.U('u_gravity'), gx, gy);
   gl.uniform1f(P.update.U('u_dt'), dt);
   gl.uniform1f(P.update.U('u_gridSize'), S.GRID);
-  gl.uniform1f(P.update.U('u_damping'), DAMPING);
-  gl.uniform1f(P.update.U('u_rest'),  REST);
-  gl.uniform1f(P.update.U('u_stiff'), STIFF);
-  gl.uniform1f(P.update.U('u_xsph'),  XSPH);
+  gl.uniform1f(P.update.U('u_damping'), PR.damping);
+  gl.uniform1f(P.update.U('u_rest'),  PR.rest);
+  gl.uniform1f(P.update.U('u_stiff'), PR.stiff);
+  gl.uniform1f(P.update.U('u_xsph'),  PR.xsph);
   gl.bindVertexArray(S.quadVAO);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   cur = nxt;
@@ -632,29 +783,32 @@ function render() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, S.canvas.width, S.canvas.height);
 
-  // Background: fluid surface (from density) + collision walls
+  // Background: fluid surface (from density) + collision walls.
+  // u_blobAlpha=0 hides the fluid (debug aid: see only particles).
   gl.useProgram(P.bg);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, S.collisionTex);
   gl.uniform1i(P.bg.U('u_collision'), 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, S.densityTex);
   gl.uniform1i(P.bg.U('u_density'), 1);
   gl.uniform2f(P.bg.U('u_aspect'), S.aspect[0], S.aspect[1]);
-  gl.uniform1f(P.bg.U('u_rest'), REST);
+  gl.uniform1f(P.bg.U('u_rest'), PR.rest);
+  gl.uniform1f(P.bg.U('u_blobAlpha'), PR.showBlob ? 1.0 : 0.0);
   gl.bindVertexArray(S.quadVAO);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-  // Particles (additive)
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
-  gl.useProgram(P.render);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, S.stateTex[cur]);
-  gl.uniform1i(P.render.U('u_state'), 0);
-  gl.uniform1f(P.render.U('u_nside'), S.N_SIDE);
-  gl.uniform1f(P.render.U('u_pointSize'), 4.0 * S.DPR);
-  gl.uniform2f(P.render.U('u_aspect'), S.aspect[0], S.aspect[1]);
-  gl.bindVertexArray(S.idxVAO);
-  gl.drawArrays(gl.POINTS, 0, S.N);
-  gl.disable(gl.BLEND);
+  if (PR.showPts) {
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    gl.useProgram(P.render);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, S.stateTex[cur]);
+    gl.uniform1i(P.render.U('u_state'), 0);
+    gl.uniform1f(P.render.U('u_nside'), S.N_SIDE);
+    gl.uniform1f(P.render.U('u_pointSize'), 4.0 * S.DPR);
+    gl.uniform2f(P.render.U('u_aspect'), S.aspect[0], S.aspect[1]);
+    gl.bindVertexArray(S.idxVAO);
+    gl.drawArrays(gl.POINTS, 0, S.N);
+    gl.disable(gl.BLEND);
+  }
 }
 
 // FPS counter
@@ -675,7 +829,7 @@ function frame() {
     fpsEl.textContent = fps;
     fpsT = now; fpsN = 0;
     // Fallback gravity if no motion events for a while
-    if (now - lastMotionTs > 1500) { gx = 0; gy = -1.4; }
+    if (now - lastMotionTs > 1500) { gMotionX = 0; gMotionY = -1; }
   }
   requestAnimationFrame(frame);
 }
