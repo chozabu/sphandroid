@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.7<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.8<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -601,6 +601,21 @@ const S = window.__sph;
 const gl = S.gl;
 const P = S.programs;
 
+// Live-tunable params. MUST be declared before any panel-binding code
+// runs, or the slider apply() callbacks hit a temporal dead zone.
+S.params = {
+  splatPt: 10.0,
+  rest:    22.0,
+  stiff:   0.6,
+  xsph:    0.12,
+  damping: 0.997,
+  gravity: 1.4,
+  showBlob: 1,
+  showPts:  1,
+};
+const PR = S.params;
+let cur = 0; // ping-pong index
+
 // ----- Input: pointer drawing -----
 let painting = false;
 function paintAt(uvX, uvY) {
@@ -732,21 +747,6 @@ function updateAspect() {
   if (w > h) { S.aspect[0] = h / w; S.aspect[1] = 1.0; }
   else       { S.aspect[0] = 1.0;   S.aspect[1] = w / h; }
 }
-
-let cur = 0; // ping-pong index
-// Live-tunable params. Bound to sliders in the panel UI; defaults match
-// the slider initial values in HTML.
-S.params = {
-  splatPt: 10.0,
-  rest:    22.0,
-  stiff:   0.6,
-  xsph:    0.12,
-  damping: 0.997,
-  gravity: 1.4,
-  showBlob: 1,
-  showPts:  1,
-};
-const PR = S.params;
 
 function splatScalarField(prog, fbo) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
