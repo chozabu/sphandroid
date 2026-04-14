@@ -93,7 +93,9 @@ void main() {
   gl_PointSize = u_pointSize;
 }`;
 
-// Splat fragment: compact radial kernel
+// Splat fragment: smooth Gaussian-like kernel with cubic-spline shape.
+// Wide soft kernels avoid the step-y density field that traps particles
+// in hex lattices.
 S.FS_SPLAT = `#version 300 es
 precision highp float;
 out vec4 outColor;
@@ -101,11 +103,14 @@ void main() {
   vec2 c = gl_PointCoord - 0.5;
   float r2 = dot(c, c);
   if (r2 > 0.25) discard;
-  float k = 1.0 - 4.0 * r2; // cone kernel, 0 at edge
+  float r = sqrt(r2) * 2.0;          // [0,1]
+  float k = 1.0 - 3.0*r*r + 2.0*r*r*r; // cubic Hermite, smooth at center & edge
   outColor = vec4(k, 0.0, 0.0, 1.0);
 }`;
 
-// Force-field pass: density -> -grad(pressure) / density
+// Force-field pass: density -> -grad(pressure) / density.
+// Uses a slightly nonlinear (Tait-ish) pressure with a small "background"
+// term so even moderately-dense interiors produce gradient, not just edges.
 S.FS_FORCE = `#version 300 es
 precision highp float;
 in vec2 v_uv;
@@ -114,17 +119,21 @@ uniform float u_gridSize;
 uniform float u_rest;
 uniform float u_stiff;
 out vec4 outColor;
-float pressure(float d) { return u_stiff * max(d - u_rest, 0.0); }
+float pressure(float d) {
+  float x = max(d / u_rest, 0.0);
+  // Tait-ish: soft below rest, much stiffer above.
+  return u_stiff * (x*x - 1.0);
+}
 void main() {
-  float h = 1.0 / u_gridSize;
+  float h = 1.5 / u_gridSize;        // wider stencil = smoother gradient field
   float dc = texture(u_density, v_uv).r;
   float dl = texture(u_density, v_uv - vec2(h, 0.0)).r;
   float dr = texture(u_density, v_uv + vec2(h, 0.0)).r;
   float du = texture(u_density, v_uv + vec2(0.0, h)).r;
   float dd = texture(u_density, v_uv - vec2(0.0, h)).r;
   vec2 gradP = vec2(pressure(dr) - pressure(dl),
-                    pressure(du) - pressure(dd)) * 0.5;
-  vec2 force = -gradP / max(dc, 0.25);
+                    pressure(du) - pressure(dd)) / (2.0 * h * u_gridSize);
+  vec2 force = -gradP / max(dc, 0.5);
   outColor = vec4(force, dc, 1.0);
 }`;
 
@@ -145,8 +154,10 @@ void main() {
   vec2 pos = s.xy;
   vec2 vel = s.zw;
 
+  // Sample force at the particle position with linear interpolation
+  // (LINEAR filter on u_force is what breaks hex clumping).
   vec2 force = texture(u_force, pos).xy;
-  vel += u_dt * (force * 40.0 + u_gravity);
+  vel += u_dt * (force * 90.0 + u_gravity);
   vel *= u_damping;
 
   vec2 newPos = pos + u_dt * vel;
@@ -286,12 +297,13 @@ S.programs = {
 };
 
 // --- Textures & FBOs ---
-function makeTex(w, h, internalFormat, format, type, data) {
+function makeTex(w, h, internalFormat, format, type, data, linear) {
   const t = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, data || null);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  const f = linear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   return t;
@@ -325,11 +337,13 @@ S.stateTex = [
 ];
 S.stateFBO = [makeFBO(S.stateTex[0]), makeFBO(S.stateTex[1])];
 
-S.densityTex   = makeTex(S.GRID, S.GRID, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT);
+// Linear filtering for grid textures: critical so particles within a single
+// grid cell don't all get the exact same force (which causes hex clumping).
+S.densityTex   = makeTex(S.GRID, S.GRID, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, null, true);
 S.densityFBO   = makeFBO(S.densityTex);
-S.forceTex     = makeTex(S.GRID, S.GRID, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT);
+S.forceTex     = makeTex(S.GRID, S.GRID, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, null, true);
 S.forceFBO     = makeFBO(S.forceTex);
-S.collisionTex = makeTex(S.GRID, S.GRID, gl.R8,     gl.RED,  gl.UNSIGNED_BYTE);
+S.collisionTex = makeTex(S.GRID, S.GRID, gl.R8,     gl.RED,  gl.UNSIGNED_BYTE, null, true);
 S.collisionFBO = makeFBO(S.collisionTex);
 
 // --- Geometry ---
@@ -487,7 +501,7 @@ function step(dt) {
   gl.bindTexture(gl.TEXTURE_2D, S.stateTex[cur]);
   gl.uniform1i(P.splat.U('u_state'), 0);
   gl.uniform1f(P.splat.U('u_nside'), S.N_SIDE);
-  gl.uniform1f(P.splat.U('u_pointSize'), 8.0);
+  gl.uniform1f(P.splat.U('u_pointSize'), 14.0);
   gl.bindVertexArray(S.idxVAO);
   gl.drawArrays(gl.POINTS, 0, S.N);
   gl.disable(gl.BLEND);
@@ -500,8 +514,8 @@ function step(dt) {
   gl.bindTexture(gl.TEXTURE_2D, S.densityTex);
   gl.uniform1i(P.force.U('u_density'), 0);
   gl.uniform1f(P.force.U('u_gridSize'), S.GRID);
-  gl.uniform1f(P.force.U('u_rest'),  2.0);
-  gl.uniform1f(P.force.U('u_stiff'), 0.6);
+  gl.uniform1f(P.force.U('u_rest'),  6.0);
+  gl.uniform1f(P.force.U('u_stiff'), 1.2);
   gl.bindVertexArray(S.quadVAO);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
