@@ -19,9 +19,9 @@
   button:active { background:#333; }
   #panel { position:fixed; bottom:8px; left:8px; right:8px; z-index:10;
     background:#0a0a0aee; border:1px solid #333; border-radius:8px;
-    padding:10px 12px; font-size:12px; max-height:50vh; overflow-y:auto;
+    padding:10px 12px; font-size:12px; max-height:40vh; overflow-y:auto;
     transition: max-height 0.2s; }
-  #panel.collapsed { max-height: 28px; overflow:hidden; padding:6px 12px; }
+  #panel.collapsed { max-height: 30px; overflow:hidden; padding:6px 12px; }
   #panelHdr { display:flex; justify-content:space-between; align-items:center;
     cursor:pointer; user-select:none; font-weight:bold; }
   .row { display:grid; grid-template-columns: 90px 1fr 56px; gap:8px;
@@ -38,14 +38,14 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.5<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.6<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
   <button id="motion">Enable motion</button>
 </div>
-<div id="panel" class="">
-  <div id="panelHdr"><span>Tuning</span><span id="panelToggle">▼</span></div>
+<div id="panel" class="collapsed">
+  <div id="panelHdr"><span>Tuning ▾ (tap to expand)</span><span id="panelToggle">▲</span></div>
   <div id="panelBody">
     <div class="row">
       <label>particles</label>
