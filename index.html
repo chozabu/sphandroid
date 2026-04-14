@@ -31,14 +31,15 @@
   .row .val { text-align:right; font-variant-numeric: tabular-nums; opacity:0.9; }
   .row select { width:100%; background:#1a1a1a; color:#fff; border:1px solid #333;
     padding:4px; border-radius:4px; font-size:12px; }
-  #err { position:fixed; inset:0; display:none; align-items:center;
-    justify-content:center; padding:20px; background:#200; color:#fcc;
-    font-size:14px; text-align:center; z-index:99; }
+  #err { position:fixed; inset:0; display:none; align-items:flex-start;
+    justify-content:center; padding:20px; background:#200ee; color:#fcc;
+    font-size:13px; text-align:left; z-index:99; overflow-y:auto;
+    white-space:pre-wrap; font-family: monospace; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.6<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.7<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -105,6 +106,24 @@
 "use strict";
 // === SPH GPU FLUID ===
 // Approach: grid-based density splat + Lagrangian particles in float textures.
+
+// Make any uncaught error visible on screen so phone debugging is possible
+// without USB devtools.
+(function () {
+  const errEl = document.getElementById('err');
+  function show(msg) {
+    errEl.style.display = 'flex';
+    errEl.textContent = (errEl.textContent ? errEl.textContent + '\n\n' : '') + msg;
+  }
+  window.addEventListener('error', (e) => {
+    show('JS Error: ' + (e.message || e) +
+      (e.filename ? '\n  at ' + e.filename + ':' + e.lineno + ':' + e.colno : ''));
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    show('Promise rejection: ' + (e.reason && e.reason.message || e.reason));
+  });
+  window.__showErr = show;
+})();
 // Pass 1: splat particle kernels into densityTex (additive blend).
 // Pass 2: fullscreen pass -> forceTex = -grad(pressure)/density.
 // Pass 3: fullscreen pass -> next stateTex (pos,vel) integrating force, gravity,
@@ -137,6 +156,7 @@ window.__sph = { gl, canvas, N_SIDE, N, GRID, DPR, fail };
 </script>
 <script id="shaders">
 "use strict";
+try {
 (function () {
 const S = window.__sph;
 
@@ -400,9 +420,11 @@ void main() {
   outColor = vec4(u_value * a, 0.0, 0.0, 1.0);
 }`;
 })();
+} catch (e) { window.__showErr('shaders: ' + e.message + '\n' + (e.stack||'')); throw e; }
 </script>
 <script id="setup">
 "use strict";
+try {
 (function () {
 const S = window.__sph;
 const gl = S.gl;
@@ -569,9 +591,11 @@ S.clearCollision = function () {
 };
 S.clearCollision();
 })();
+} catch (e) { window.__showErr('setup: ' + e.message + '\n' + (e.stack||'')); throw e; }
 </script>
 <script id="loop">
 "use strict";
+try {
 (function () {
 const S = window.__sph;
 const gl = S.gl;
@@ -835,6 +859,7 @@ function frame() {
 }
 requestAnimationFrame(frame);
 })();
+} catch (e) { window.__showErr('loop: ' + e.message + '\n' + (e.stack||'')); throw e; }
 </script>
 </body>
 </html>
