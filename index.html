@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.10 (real SPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.11 (real SPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -359,6 +359,13 @@ void main() {
   vec2 pos = s.xy;
   vec2 vel = s.zw;
 
+  // Per-particle unique direction, used below to break symmetry when
+  // this particle is in a collapsed cluster (no visible neighbours).
+  float rh1 = fract(sin(dot(v_uv, vec2(12.9898, 78.233))) * 43758.5453);
+  float rh2 = fract(sin(dot(v_uv + vec2(3.71, 1.93),
+                             vec2(12.9898, 78.233))) * 43758.5453);
+  vec2 sbDir = normalize(vec2(rh1, rh2) - 0.5 + vec2(1e-3, 0.0));
+
   vec2 posCl = clamp(pos, 1e-4, 1.0 - 1e-4);
   vec2 cell = floor(posCl * u_gridHash);
 
@@ -378,6 +385,15 @@ void main() {
       process(texture(u_hash3, cellUV), pos, vel, force, visSum, visW);
     }
   }
+
+  // Symmetry-breaking anti-collapse kick. When a particle can't find
+  // any valid non-coincident neighbour (visW ≈ 0), it's almost
+  // certainly inside a dense cluster where hash-slot collisions have
+  // hidden everyone else. Push it along its own unique direction so
+  // two stuck particles (with different sbDir) escape each other.
+  // Fades out smoothly as real neighbours re-appear.
+  float sbStrength = smoothstep(0.08, 0.0, visW);
+  force += sbDir * sbStrength * u_stiff * u_h * u_h * 2.0;
 
   if (visW > 1e-6) {
     vec2 avgVel = visSum / visW;
