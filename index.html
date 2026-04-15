@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.9 (real SPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.10 (real SPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -76,13 +76,13 @@
     </div>
     <div class="row">
       <label>stiffness</label>
-      <input id="s_stiff" type="range" min="1" max="600" step="1" value="120">
-      <span class="val" id="v_stiff">120</span>
+      <input id="s_stiff" type="range" min="1" max="4000" step="1" value="400">
+      <span class="val" id="v_stiff">400</span>
     </div>
     <div class="row">
       <label>viscosity</label>
-      <input id="s_xsph" type="range" min="0" max="0.5" step="0.01" value="0.12">
-      <span class="val" id="v_xsph">0.12</span>
+      <input id="s_xsph" type="range" min="0" max="0.5" step="0.01" value="0.05">
+      <span class="val" id="v_xsph">0.05</span>
     </div>
     <div class="row">
       <label>damping</label>
@@ -206,15 +206,17 @@ layout(location=0) in float a_index;
 uniform sampler2D u_state;
 uniform float u_nside;
 uniform float u_gridHash;
-uniform float u_K;
-uniform float u_slot;
-out vec4 v_state;
+uniform int u_K;
+uniform int u_slot;
+flat out vec4 v_state;
 void main() {
-  float idx = a_index;
-  vec2 uv = (vec2(mod(idx, u_nside), floor(idx / u_nside)) + 0.5) / u_nside;
+  int idxI = int(a_index + 0.5);
+  float idxF = float(idxI);
+  float nside = u_nside;
+  vec2 uv = (vec2(mod(idxF, nside), floor(idxF / nside)) + 0.5) / nside;
   vec4 s = texture(u_state, uv);
   v_state = s;
-  if (mod(idx, u_K) != u_slot) {
+  if ((idxI - (idxI / u_K) * u_K) != u_slot) {
     gl_Position = vec4(-10.0, -10.0, 0.0, 1.0);
     gl_PointSize = 1.0;
     return;
@@ -228,7 +230,7 @@ void main() {
 
 S.FS_HASH = `#version 300 es
 precision highp float;
-in vec4 v_state;
+flat in vec4 v_state;
 out vec4 outColor;
 void main() {
   outColor = v_state;
@@ -556,12 +558,15 @@ function makeFBO(tex) {
   return f;
 }
 
-// Initial particle layout (random in central rectangle)
+// Initial particle layout: spread uniformly over most of the sim so
+// the spatial-hash cells don't overflow at frame 0. (A dense initial
+// cluster can wipe out 80%+ of particles' hash entries via slot
+// collisions, which looks like "no repulsion => collapse".)
 function initialState() {
   const arr = new Float32Array(S.N * 4);
   for (let i = 0; i < S.N; i++) {
-    arr[i*4+0] = 0.30 + Math.random() * 0.40;
-    arr[i*4+1] = 0.55 + Math.random() * 0.35;
+    arr[i*4+0] = 0.05 + Math.random() * 0.90;
+    arr[i*4+1] = 0.05 + Math.random() * 0.90;
     arr[i*4+2] = 0;
     arr[i*4+3] = 0;
   }
@@ -687,7 +692,7 @@ S.params = {
   splatPt: 10.0,    // only affects the visual-only bg density blob now
   rest:    22.0,    // ditto (used by bg shader for blob threshold)
   h:       0.045,   // SPH kernel support radius (sim units)
-  stiff:   120.0,   // pairwise repulsion strength
+  stiff:   400.0,   // pairwise repulsion strength
   xsph:    0.05,    // pairwise viscosity blend per substep (0..1)
   damping: 0.997,
   gravity: 1.4,
@@ -854,6 +859,8 @@ function step(dt) {
 
   // 1) Build K spatial-hash textures. Each pass renders all N particles
   //    but only those with index%K == slot end up on-screen at their cell.
+  gl.disable(gl.BLEND);           // hash writes need last-write-wins, not sum
+  gl.disable(gl.DEPTH_TEST);
   for (let k = 0; k < S.K_HASH; k++) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, S.hashFBO[k]);
     gl.viewport(0, 0, S.GRID_HASH, S.GRID_HASH);
@@ -865,8 +872,8 @@ function step(dt) {
     gl.uniform1i(P.hash.U('u_state'), 0);
     gl.uniform1f(P.hash.U('u_nside'), S.N_SIDE);
     gl.uniform1f(P.hash.U('u_gridHash'), S.GRID_HASH);
-    gl.uniform1f(P.hash.U('u_K'), S.K_HASH);
-    gl.uniform1f(P.hash.U('u_slot'), k);
+    gl.uniform1i(P.hash.U('u_K'), S.K_HASH);
+    gl.uniform1i(P.hash.U('u_slot'), k);
     gl.bindVertexArray(S.idxVAO);
     gl.drawArrays(gl.POINTS, 0, S.N);
   }
