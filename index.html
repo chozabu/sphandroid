@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.15 (clean WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.16 (clean WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -409,10 +409,12 @@ void process(vec4 n, vec2 pos_i, vec2 vel_i,
   //   a = m · pᵢ / ρᵢ² · |∇W_spiky| · r̂
   //     = m · pᵢ / ρᵢ² · (30/(π·h⁵)) · (h−r)² · r̂
   aPres += u_m * p_i / (rho_i * rho_i) * spiky_c * diff * diff * dir;
-  // Müller viscosity accel:
-  //   a = μ · m · (vⱼ − vᵢ) / ρᵢ · ∇²W_visc
-  //     = μ · m · (vⱼ − vᵢ) / ρᵢ · (20/(π·h⁵)) · (h−r)
-  aVisc += u_mu * u_m / rho_i * visc_c * diff * (n.zw - vel_i);
+  // Müller viscosity accel = viscosity FORCE / ρᵢ:
+  //   f = μ·m·(vⱼ−vᵢ)/ρⱼ · ∇²W_visc         (force)
+  //   a = f/ρᵢ ≈ μ·m·(vⱼ−vᵢ)/(ρᵢ·ρⱼ) · ∇²W  (accel; ρⱼ≈ρᵢ → /ρᵢ²)
+  // (v0.15 was missing one /ρ factor — correct viscosity was 1×,
+  //  compressed regions got over-damped up to ρ² times what they should.)
+  aVisc += u_mu * u_m / (rho_i * rho_i) * visc_c * diff * (n.zw - vel_i);
 }
 
 void main() {
@@ -629,15 +631,17 @@ function makeFBO(tex) {
   return f;
 }
 
-// Initial particle layout: spread uniformly over most of the sim so
-// the spatial-hash cells don't overflow at frame 0. (A dense initial
-// cluster can wipe out 80%+ of particles' hash entries via slot
-// collisions, which looks like "no repulsion => collapse".)
+// Initial particle layout: spread uniformly over essentially the whole
+// sim so the initial Poly6 density matches ρ₀ = 1 (N·m / area = 1·(1/N)
+// / ~1 = 1). If we instead used [0.05, 0.95]² (area 0.81), the initial
+// density would be 1/0.81 ≈ 1.235 — 23 % over rest, which with a γ=7
+// Tait EoS gives a huge explosive transient as the boundary particles
+// blast outward against the walls before gravity kicks in.
 function initialState() {
   const arr = new Float32Array(S.N * 4);
   for (let i = 0; i < S.N; i++) {
-    arr[i*4+0] = 0.05 + Math.random() * 0.90;
-    arr[i*4+1] = 0.05 + Math.random() * 0.90;
+    arr[i*4+0] = 0.005 + Math.random() * 0.99;
+    arr[i*4+1] = 0.005 + Math.random() * 0.99;
     arr[i*4+2] = 0;
     arr[i*4+3] = 0;
   }
