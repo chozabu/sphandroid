@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.13 (Tait WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.14 (Müller visc)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -81,13 +81,13 @@
     </div>
     <div class="row">
       <label>viscosity</label>
-      <input id="s_xsph" type="range" min="0" max="0.5" step="0.01" value="0.05">
-      <span class="val" id="v_xsph">0.05</span>
+      <input id="s_visc" type="range" min="0" max="50" step="0.5" value="8">
+      <span class="val" id="v_visc">8</span>
     </div>
     <div class="row">
       <label>damping</label>
-      <input id="s_damp" type="range" min="0.95" max="1" step="0.001" value="0.998">
-      <span class="val" id="v_damp">0.998</span>
+      <input id="s_damp" type="range" min="0.97" max="1" step="0.001" value="0.999">
+      <span class="val" id="v_damp">0.999</span>
     </div>
     <div class="row">
       <label>gravity</label>
@@ -96,8 +96,13 @@
     </div>
     <div class="row">
       <label>v cap</label>
-      <input id="s_vmax" type="range" min="0.5" max="10" step="0.1" value="2">
-      <span class="val" id="v_vmax">2.0</span>
+      <input id="s_vmax" type="range" min="0.5" max="10" step="0.1" value="3">
+      <span class="val" id="v_vmax">3.0</span>
+    </div>
+    <div class="row">
+      <label>substeps</label>
+      <input id="s_subs" type="range" min="1" max="12" step="1" value="4">
+      <span class="val" id="v_subs">4</span>
     </div>
     <div class="row">
       <label>show fluid</label>
@@ -340,12 +345,12 @@ uniform float u_damping;
 uniform float u_h;
 uniform float u_rest;
 uniform float u_stiff;
-uniform float u_xsph;
+uniform float u_visc;     // Müller viscosity-force strength
 uniform float u_vmax;
 out vec4 outColor;
 
 void process(vec4 n, vec2 pos_i, vec2 vel_i, float pscale,
-             inout vec2 force, inout vec2 visSum, inout float visW) {
+             inout vec2 force, inout vec2 viscForce) {
   if (n.x < -0.5) return;
   vec2 r = pos_i - n.xy;
   float rr = dot(r, r);
@@ -353,10 +358,14 @@ void process(vec4 n, vec2 pos_i, vec2 vel_i, float pscale,
   if (rr >= h2 || rr < 1e-12) return;
   float rLen = sqrt(rr);
   float diff = u_h - rLen;
-  // Spiky-gradient direction × Müller's pressure/density² scaling.
+  // Tait pressure × Spiky-gradient direction (unnormalized).
   force += pscale * diff * diff * (r / rLen);
-  visSum += n.zw * diff;
-  visW   += diff;
+  // Müller viscosity: force proportional to velocity DIFFERENCE,
+  // weighted by viscosity-laplacian kernel (h-r). Uniform flow has
+  // zero drag (momentum conserved); high-velocity gradients get
+  // dissipated. Replaces the old XSPH-position-blend which was
+  // dissipating uniform flow too.
+  viscForce += (n.zw - vel_i) * diff;
 }
 
 void main() {
@@ -387,9 +396,8 @@ void main() {
   vec2 posCl = clamp(pos, 1e-4, 1.0 - 1e-4);
   vec2 cell = floor(posCl * u_gridHash);
 
-  vec2 force  = vec2(0.0);
-  vec2 visSum = vec2(0.0);
-  float visW  = 0.0;
+  vec2 force     = vec2(0.0);
+  vec2 viscForce = vec2(0.0);
 
   for (int dy = -2; dy <= 2; dy++) {
     for (int dx = -2; dx <= 2; dx++) {
@@ -397,24 +405,21 @@ void main() {
       if (nCell.x < 0.0 || nCell.x >= u_gridHash ||
           nCell.y < 0.0 || nCell.y >= u_gridHash) continue;
       vec2 cellUV = (nCell + 0.5) / u_gridHash;
-      process(texture(u_hash0, cellUV), pos, vel, pscale, force, visSum, visW);
-      process(texture(u_hash1, cellUV), pos, vel, pscale, force, visSum, visW);
-      process(texture(u_hash2, cellUV), pos, vel, pscale, force, visSum, visW);
-      process(texture(u_hash3, cellUV), pos, vel, pscale, force, visSum, visW);
+      process(texture(u_hash0, cellUV), pos, vel, pscale, force, viscForce);
+      process(texture(u_hash1, cellUV), pos, vel, pscale, force, viscForce);
+      process(texture(u_hash2, cellUV), pos, vel, pscale, force, viscForce);
+      process(texture(u_hash3, cellUV), pos, vel, pscale, force, viscForce);
     }
   }
 
-  // Symmetry-breaking kick when nothing visible nearby (anti-collapse).
-  // NOTE: smoothstep requires edge0 < edge1 — had them reversed (UB) before.
-  float sbStrength = 1.0 - smoothstep(0.0, 0.08, visW);
-  force += sbDir * sbStrength * max(u_stiff, 100.0) * u_h * u_h * 2.0;
+  // Anti-collapse kick: use grid density as "isolated/stuck" detector.
+  // Low density means either no neighbours visible (stuck) or truly alone.
+  float sbStrength = 1.0 - smoothstep(0.5, 3.0, density);
+  force += sbDir * sbStrength * max(u_stiff, 50.0) * u_h * u_h * 2.0;
 
-  if (visW > 1e-6) {
-    vec2 avgVel = visSum / visW;
-    vel = mix(vel, avgVel, u_xsph);
-  }
-
-  vel += u_dt * (force + u_gravity);
+  // Forces: pressure (conservative) + viscosity (dissipative, only
+  // affects velocity differences) + gravity. Integrated explicitly.
+  vel += u_dt * (force + u_visc * viscForce + u_gravity);
   vel *= u_damping;
 
   // CFL-style velocity cap so a big single-frame impulse can't shoot a
@@ -728,10 +733,11 @@ S.params = {
   rest:    6.0,     // rest density ρ₀ (auto-tuned when N changes)
   h:       0.045,   // SPH kernel support radius (sim units)
   stiff:   100.0,   // Tait stiffness (p = stiff · ((ρ/ρ₀)³ − 1))
-  xsph:    0.05,    // pairwise viscosity blend per substep
-  damping: 0.998,
+  visc:    8.0,     // Müller viscosity force strength (f ∝ visc·Δv·(h-r))
+  damping: 0.999,   // 1.0 = no damping, <1 = exponential decay
   gravity: 1.4,
-  vmax:    2.0,     // CFL-style cap on per-frame velocity
+  vmax:    3.0,     // cap on per-substep velocity
+  substeps: 4,      // integration substeps per frame (higher = more stable)
   showBlob: 1,
   showPts:  1,
 };
@@ -803,10 +809,11 @@ bindSlider('s_splat', 'v_splat', 'splatPt',  (x) => x.toFixed(0));
 bindSlider('s_rest',  'v_rest',  'rest',     (x) => x.toFixed(1));
 bindSlider('s_h',     'v_h',     'h',        (x) => x.toFixed(3));
 bindSlider('s_stiff', 'v_stiff', 'stiff',    (x) => x.toFixed(0));
-bindSlider('s_xsph',  'v_xsph',  'xsph',     (x) => x.toFixed(2));
+bindSlider('s_visc',  'v_visc',  'visc',     (x) => x.toFixed(1));
 bindSlider('s_damp',  'v_damp',  'damping',  (x) => x.toFixed(3));
 bindSlider('s_grav',  'v_grav',  'gravity',  (x) => x.toFixed(2));
 bindSlider('s_vmax',  'v_vmax',  'vmax',     (x) => x.toFixed(1));
+bindSlider('s_subs',  'v_subs',  'substeps', (x) => x.toFixed(0));
 bindSlider('s_blob',  'v_blob',  'showBlob', (x) => x ? 'on' : 'off');
 bindSlider('s_pts',   'v_pts',   'showPts',  (x) => x ? 'on' : 'off');
 
@@ -956,7 +963,7 @@ function step(dt) {
   gl.uniform1f(P.update.U('u_h'),     PR.h);
   gl.uniform1f(P.update.U('u_rest'),  PR.rest);
   gl.uniform1f(P.update.U('u_stiff'), PR.stiff);
-  gl.uniform1f(P.update.U('u_xsph'),  PR.xsph);
+  gl.uniform1f(P.update.U('u_visc'),  PR.visc);
   gl.uniform1f(P.update.U('u_vmax'),  PR.vmax);
   gl.bindVertexArray(S.quadVAO);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -1001,9 +1008,12 @@ let fpsT = performance.now(), fpsN = 0;
 
 function frame() {
   updateAspect();
-  // Two substeps per frame for stability
-  step(0.008);
-  step(0.008);
+  // Sub-step integration: dt_frame is fixed (~16 ms), dt_substep is
+  // dt_frame / substeps. More substeps → smaller dt → more stable at
+  // high Tait pressures, at proportional GPU cost.
+  const nSub = Math.max(1, Math.round(PR.substeps));
+  const dt = 0.016 / nSub;
+  for (let i = 0; i < nSub; i++) step(dt);
   render();
 
   fpsN++;
