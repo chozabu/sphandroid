@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.8<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.9 (real SPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -70,9 +70,14 @@
       <span class="val" id="v_rest">22</span>
     </div>
     <div class="row">
+      <label>kernel h</label>
+      <input id="s_h" type="range" min="0.015" max="0.12" step="0.001" value="0.045">
+      <span class="val" id="v_h">0.045</span>
+    </div>
+    <div class="row">
       <label>stiffness</label>
-      <input id="s_stiff" type="range" min="0.05" max="4" step="0.05" value="0.6">
-      <span class="val" id="v_stiff">0.60</span>
+      <input id="s_stiff" type="range" min="1" max="600" step="1" value="120">
+      <span class="val" id="v_stiff">120</span>
     </div>
     <div class="row">
       <label>viscosity</label>
@@ -105,7 +110,14 @@
 <script id="main">
 "use strict";
 // === SPH GPU FLUID ===
-// Approach: grid-based density splat + Lagrangian particles in float textures.
+// Approach: real SPH with spatial-hash neighbour search on the GPU.
+// Each frame the K=4 spatial-hash textures are rebuilt by rasterising
+// every particle to one pixel in its grid cell (K slots to reduce
+// last-write collisions). The update shader then iterates a 5x5
+// neighbour-cell window across all K slots, accumulating direct
+// pairwise repulsion + XSPH viscosity — no density-grid smoothing, so
+// sub-pixel-close particles still feel each other.
+// A cheap density splat is still run to render the fluid-blob bg.
 
 // Make any uncaught error visible on screen so phone debugging is possible
 // without USB devtools.
@@ -183,6 +195,45 @@ void main() {
   gl_PointSize = u_pointSize;
 }`;
 
+// Hash-build vertex: rasterizes each particle to a single pixel in its
+// spatial-hash cell. Particles are split across K slots by index; only
+// the slot-matching particles render this pass, the rest are pushed
+// off-screen. Last-write-wins handles the rare case of 2+ particles in
+// the same cell & slot (losses only mean a neighbour is occasionally
+// skipped, not a physics bug).
+S.VS_HASH = `#version 300 es
+layout(location=0) in float a_index;
+uniform sampler2D u_state;
+uniform float u_nside;
+uniform float u_gridHash;
+uniform float u_K;
+uniform float u_slot;
+out vec4 v_state;
+void main() {
+  float idx = a_index;
+  vec2 uv = (vec2(mod(idx, u_nside), floor(idx / u_nside)) + 0.5) / u_nside;
+  vec4 s = texture(u_state, uv);
+  v_state = s;
+  if (mod(idx, u_K) != u_slot) {
+    gl_Position = vec4(-10.0, -10.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+    return;
+  }
+  vec2 pos = clamp(s.xy, 1e-4, 1.0 - 1e-4);
+  vec2 cell = floor(pos * u_gridHash);
+  vec2 cellUV = (cell + 0.5) / u_gridHash;
+  gl_Position = vec4(cellUV * 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = 1.0;
+}`;
+
+S.FS_HASH = `#version 300 es
+precision highp float;
+in vec4 v_state;
+out vec4 outColor;
+void main() {
+  outColor = v_state;
+}`;
+
 // Velocity-splat vertex: same as density splat but also forwards velocity.
 S.VS_VSPLAT = `#version 300 es
 layout(location=0) in float a_index;
@@ -258,33 +309,47 @@ void main() {
   outColor = vec4(force, dc, 1.0);
 }`;
 
-// Particle update pass.
-//   * Force is computed PER PARTICLE by sampling density at sub-cell
-//     positions (not from a precomputed grid force texture). LINEAR
-//     filtering on u_density gives sub-texel gradient resolution.
-//   * XSPH viscosity couples each particle's velocity to the kernel-weighted
-//     average velocity of nearby particles (sampled from u_velGrid). This
-//     prevents static hex-packed clusters: any neighbour that's moving
-//     drags the cluster's interior particles with it.
+// Particle update pass (real SPH with spatial-hash neighbour search).
+// For each particle we iterate a 5x5 window of hash cells across K=4
+// hash slots and, for every stored neighbour within radius u_h, add a
+// pairwise spiky-gradient repulsion + XSPH viscosity contribution.
+// Because each pair is evaluated directly (no density-grid smoothing),
+// coincident and sub-pixel-close particles DO feel each other.
 S.FS_UPDATE = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_state;
-uniform sampler2D u_density;
-uniform sampler2D u_velGrid;
+uniform sampler2D u_hash0;
+uniform sampler2D u_hash1;
+uniform sampler2D u_hash2;
+uniform sampler2D u_hash3;
 uniform sampler2D u_collision;
 uniform vec2  u_gravity;
 uniform float u_dt;
-uniform float u_gridSize;
+uniform float u_gridHash;
+uniform float u_gridColl;
 uniform float u_damping;
-uniform float u_rest;
-uniform float u_stiff;
+uniform float u_h;        // SPH support radius, in sim units
+uniform float u_stiff;    // pairwise repulsion strength
 uniform float u_xsph;     // 0..1 viscosity blend strength
 out vec4 outColor;
 
-float pressure(float d) {
-  float x = max(d / u_rest, 0.0);
-  return u_stiff * (x*x - 1.0);
+void process(vec4 n, vec2 pos_i, vec2 vel_i,
+             inout vec2 force, inout vec2 visSum, inout float visW) {
+  // -10 sentinel = empty hash cell
+  if (n.x < -0.5) return;
+  vec2 r = pos_i - n.xy;
+  float rr = dot(r, r);
+  float h2 = u_h * u_h;
+  if (rr >= h2 || rr < 1e-12) return;  // out of range or self
+  float rLen = sqrt(rr);
+  float diff = u_h - rLen;
+  // Spiky-style pairwise repulsion: strongest at close approach,
+  // smooth zero at the boundary.
+  force += u_stiff * diff * diff * (r / rLen);
+  // Pairwise XSPH viscosity (kernel-weighted neighbour velocity average).
+  visSum += n.zw * diff;
+  visW   += diff;
 }
 
 void main() {
@@ -292,23 +357,30 @@ void main() {
   vec2 pos = s.xy;
   vec2 vel = s.zw;
 
-  // Per-particle pressure-gradient force, sampled at the particle's
-  // exact sub-cell position so neighbouring particles in the same cell
-  // get distinct forces.
-  float h = 1.0 / u_gridSize;
-  float dC = texture(u_density, pos).r;
-  float dL = texture(u_density, pos - vec2(h, 0.0)).r;
-  float dR = texture(u_density, pos + vec2(h, 0.0)).r;
-  float dU = texture(u_density, pos + vec2(0.0, h)).r;
-  float dD = texture(u_density, pos - vec2(0.0, h)).r;
-  vec2 gradP = vec2(pressure(dR) - pressure(dL),
-                    pressure(dU) - pressure(dD)) / (2.0 * h);
-  vec2 force = -gradP / max(dC, 0.5);
+  vec2 posCl = clamp(pos, 1e-4, 1.0 - 1e-4);
+  vec2 cell = floor(posCl * u_gridHash);
 
-  // XSPH viscosity: pull our velocity toward the local average.
-  vec4 vSum = texture(u_velGrid, pos);
-  vec2 avgVel = vSum.xy / max(vSum.z, 1e-3);
-  vel = mix(vel, avgVel, u_xsph);
+  vec2 force  = vec2(0.0);
+  vec2 visSum = vec2(0.0);
+  float visW  = 0.0;
+
+  for (int dy = -2; dy <= 2; dy++) {
+    for (int dx = -2; dx <= 2; dx++) {
+      vec2 nCell = cell + vec2(float(dx), float(dy));
+      if (nCell.x < 0.0 || nCell.x >= u_gridHash ||
+          nCell.y < 0.0 || nCell.y >= u_gridHash) continue;
+      vec2 cellUV = (nCell + 0.5) / u_gridHash;
+      process(texture(u_hash0, cellUV), pos, vel, force, visSum, visW);
+      process(texture(u_hash1, cellUV), pos, vel, force, visSum, visW);
+      process(texture(u_hash2, cellUV), pos, vel, force, visSum, visW);
+      process(texture(u_hash3, cellUV), pos, vel, force, visSum, visW);
+    }
+  }
+
+  if (visW > 1e-6) {
+    vec2 avgVel = visSum / visW;
+    vel = mix(vel, avgVel, u_xsph);
+  }
 
   vel += u_dt * (force + u_gravity);
   vel *= u_damping;
@@ -317,25 +389,25 @@ void main() {
 
   // Walls
   float pad = 0.005;
-  if (newPos.x < pad)        { newPos.x = pad;        vel.x =  abs(vel.x) * 0.35; }
-  if (newPos.x > 1.0 - pad)  { newPos.x = 1.0 - pad;  vel.x = -abs(vel.x) * 0.35; }
-  if (newPos.y < pad)        { newPos.y = pad;        vel.y =  abs(vel.y) * 0.35; }
-  if (newPos.y > 1.0 - pad)  { newPos.y = 1.0 - pad;  vel.y = -abs(vel.y) * 0.35; }
+  if (newPos.x < pad)       { newPos.x = pad;       vel.x =  abs(vel.x) * 0.35; }
+  if (newPos.x > 1.0 - pad) { newPos.x = 1.0 - pad; vel.x = -abs(vel.x) * 0.35; }
+  if (newPos.y < pad)       { newPos.y = pad;       vel.y =  abs(vel.y) * 0.35; }
+  if (newPos.y > 1.0 - pad) { newPos.y = 1.0 - pad; vel.y = -abs(vel.y) * 0.35; }
 
   // Collision mask
   float mask = texture(u_collision, newPos).r;
   if (mask > 0.25) {
-    float h = 1.0 / u_gridSize;
-    float ml = texture(u_collision, newPos - vec2(h, 0.0)).r;
-    float mr = texture(u_collision, newPos + vec2(h, 0.0)).r;
-    float mu = texture(u_collision, newPos + vec2(0.0, h)).r;
-    float md = texture(u_collision, newPos - vec2(0.0, h)).r;
-    vec2 n = vec2(ml - mr, md - mu);
-    float nl = length(n);
+    float hc = 1.0 / u_gridColl;
+    float ml = texture(u_collision, newPos - vec2(hc, 0.0)).r;
+    float mr = texture(u_collision, newPos + vec2(hc, 0.0)).r;
+    float mu = texture(u_collision, newPos + vec2(0.0, hc)).r;
+    float md = texture(u_collision, newPos - vec2(0.0, hc)).r;
+    vec2 nrm = vec2(ml - mr, md - mu);
+    float nl = length(nrm);
     if (nl > 1e-4) {
-      n /= nl;
-      newPos = pos + n * 0.003;
-      vel = reflect(vel, n) * 0.4;
+      nrm /= nl;
+      newPos = pos + nrm * 0.003;
+      vel = reflect(vel, nrm) * 0.4;
     } else {
       newPos = pos;
       vel *= -0.3;
@@ -454,9 +526,8 @@ function link(vs, fs) {
 }
 
 S.programs = {
-  splat:  link(S.VS_SPLAT,  S.FS_SPLAT),
-  vsplat: link(S.VS_VSPLAT, S.FS_VSPLAT),
-  force:  link(S.VS_QUAD,   S.FS_FORCE),
+  splat:  link(S.VS_SPLAT,  S.FS_SPLAT),   // still used for bg blob viz
+  hash:   link(S.VS_HASH,   S.FS_HASH),   // spatial-hash build
   update: link(S.VS_QUAD,   S.FS_UPDATE),
   render: link(S.VS_RENDER, S.FS_RENDER),
   bg:     link(S.VS_QUAD,   S.FS_BG),
@@ -512,10 +583,19 @@ S.forceTex     = makeTex(S.GRID, S.GRID, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, nul
 S.forceFBO     = makeFBO(S.forceTex);
 S.collisionTex = makeTex(S.GRID, S.GRID, gl.R8,     gl.RED,  gl.UNSIGNED_BYTE, null, true);
 S.collisionFBO = makeFBO(S.collisionTex);
-// Velocity grid: per-cell sum of (vx*w, vy*w, w). Sampling gives weighted
-// average velocity around the particle, used for XSPH viscosity coupling.
-S.velTex = makeTex(S.GRID, S.GRID, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, null, true);
-S.velFBO = makeFBO(S.velTex);
+// Spatial-hash textures. Each cell stores (pos.xy, vel.xy) of one
+// particle — the "winner" of last-write. K=4 slots reduce the chance
+// of a particle being lost because another from the same cell+slot
+// overwrote it. NEAREST filtering because we want the exact cell value.
+S.K_HASH = 4;
+S.GRID_HASH = 64;
+S.hashTex = [];
+S.hashFBO = [];
+for (let i = 0; i < S.K_HASH; i++) {
+  const t = makeTex(S.GRID_HASH, S.GRID_HASH, gl.RGBA32F, gl.RGBA, gl.FLOAT, null, false);
+  S.hashTex.push(t);
+  S.hashFBO.push(makeFBO(t));
+}
 
 // --- Geometry ---
 S.quadVAO = gl.createVertexArray();
@@ -604,10 +684,11 @@ const P = S.programs;
 // Live-tunable params. MUST be declared before any panel-binding code
 // runs, or the slider apply() callbacks hit a temporal dead zone.
 S.params = {
-  splatPt: 10.0,
-  rest:    22.0,
-  stiff:   0.6,
-  xsph:    0.12,
+  splatPt: 10.0,    // only affects the visual-only bg density blob now
+  rest:    22.0,    // ditto (used by bg shader for blob threshold)
+  h:       0.045,   // SPH kernel support radius (sim units)
+  stiff:   120.0,   // pairwise repulsion strength
+  xsph:    0.05,    // pairwise viscosity blend per substep (0..1)
   damping: 0.997,
   gravity: 1.4,
   showBlob: 1,
@@ -679,7 +760,8 @@ function bindSlider(id, valId, prop, fmt) {
 }
 bindSlider('s_splat', 'v_splat', 'splatPt',  (x) => x.toFixed(0));
 bindSlider('s_rest',  'v_rest',  'rest',     (x) => x.toFixed(1));
-bindSlider('s_stiff', 'v_stiff', 'stiff',    (x) => x.toFixed(2));
+bindSlider('s_h',     'v_h',     'h',        (x) => x.toFixed(3));
+bindSlider('s_stiff', 'v_stiff', 'stiff',    (x) => x.toFixed(0));
 bindSlider('s_xsph',  'v_xsph',  'xsph',     (x) => x.toFixed(2));
 bindSlider('s_damp',  'v_damp',  'damping',  (x) => x.toFixed(3));
 bindSlider('s_grav',  'v_grav',  'gravity',  (x) => x.toFixed(2));
@@ -767,35 +849,54 @@ function splatScalarField(prog, fbo) {
 }
 
 function step(dt) {
-  // Refresh gravity from motion vector + slider (or fall back to down).
   gx = gMotionX * PR.gravity;
   gy = gMotionY * PR.gravity;
 
-  // 1) Splat density
+  // 1) Build K spatial-hash textures. Each pass renders all N particles
+  //    but only those with index%K == slot end up on-screen at their cell.
+  for (let k = 0; k < S.K_HASH; k++) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, S.hashFBO[k]);
+    gl.viewport(0, 0, S.GRID_HASH, S.GRID_HASH);
+    gl.clearColor(-10, -10, 0, 0);   // sentinel "empty cell"
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(P.hash);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, S.stateTex[cur]);
+    gl.uniform1i(P.hash.U('u_state'), 0);
+    gl.uniform1f(P.hash.U('u_nside'), S.N_SIDE);
+    gl.uniform1f(P.hash.U('u_gridHash'), S.GRID_HASH);
+    gl.uniform1f(P.hash.U('u_K'), S.K_HASH);
+    gl.uniform1f(P.hash.U('u_slot'), k);
+    gl.bindVertexArray(S.idxVAO);
+    gl.drawArrays(gl.POINTS, 0, S.N);
+  }
+
+  // 2) Density splat — still cheap, only used for the bg fluid-blob render.
   splatScalarField(P.splat, S.densityFBO);
 
-  // 2) Splat velocity (vx*w, vy*w, w)
-  splatScalarField(P.vsplat, S.velFBO);
-
-  // 3) Particle update: per-particle pressure-gradient force +
-  //    XSPH viscosity coupling + walls + collision.
+  // 3) Particle update via neighbour search on the hash textures.
   const nxt = 1 - cur;
   gl.bindFramebuffer(gl.FRAMEBUFFER, S.stateFBO[nxt]);
   gl.viewport(0, 0, S.N_SIDE, S.N_SIDE);
   gl.useProgram(P.update);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, S.stateTex[cur]);
   gl.uniform1i(P.update.U('u_state'), 0);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, S.densityTex);
-  gl.uniform1i(P.update.U('u_density'), 1);
-  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, S.velTex);
-  gl.uniform1i(P.update.U('u_velGrid'), 2);
-  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, S.collisionTex);
-  gl.uniform1i(P.update.U('u_collision'), 3);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, S.hashTex[0]);
+  gl.uniform1i(P.update.U('u_hash0'), 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, S.hashTex[1]);
+  gl.uniform1i(P.update.U('u_hash1'), 2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, S.hashTex[2]);
+  gl.uniform1i(P.update.U('u_hash2'), 3);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, S.hashTex[3]);
+  gl.uniform1i(P.update.U('u_hash3'), 4);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, S.collisionTex);
+  gl.uniform1i(P.update.U('u_collision'), 5);
   gl.uniform2f(P.update.U('u_gravity'), gx, gy);
   gl.uniform1f(P.update.U('u_dt'), dt);
-  gl.uniform1f(P.update.U('u_gridSize'), S.GRID);
+  gl.uniform1f(P.update.U('u_gridHash'), S.GRID_HASH);
+  gl.uniform1f(P.update.U('u_gridColl'), S.GRID);
   gl.uniform1f(P.update.U('u_damping'), PR.damping);
-  gl.uniform1f(P.update.U('u_rest'),  PR.rest);
+  gl.uniform1f(P.update.U('u_h'),     PR.h);
   gl.uniform1f(P.update.U('u_stiff'), PR.stiff);
   gl.uniform1f(P.update.U('u_xsph'),  PR.xsph);
   gl.bindVertexArray(S.quadVAO);
