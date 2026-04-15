@@ -469,7 +469,6 @@ void process(vec4 n, vec4 nR, vec2 pos_i, vec2 vel_i,
   // which prevents the WCSPH "stuck pairs" failure mode: below-rest-density
   // regions have p=0 under Müller's clamp, so isolated particle pairs can
   // merge freely. s_corr pushes them apart regardless of density.
-  float h2       = h_val * h_val;
   float dq2      = 0.04 * h2;                      // (0.2·h)²
   float wRatio   = (h2 - rr) / max(h2 - dq2, 1e-6);  // Poly6 ratio base
   // W_poly6 ∝ (h²-r²)³, so the ratio of W's is wRatio³.  Raise that to
