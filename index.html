@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.20<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p<br><span style="opacity:0.65">L draw · M attract · R erase</span></div>
+<div class="hud" id="hud">GPU SPH Fluid v0.21<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p<br><span style="opacity:0.65">L draw · M attract · R erase</span></div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -83,6 +83,11 @@
       <label>viscosity μ</label>
       <input id="s_mu" type="range" min="0" max="1" step="0.01" value="0.02">
       <span class="val" id="v_mu">0.02</span>
+    </div>
+    <div class="row">
+      <label>anti-clump</label>
+      <input id="s_k" type="range" min="0" max="0.5" step="0.005" value="0.1">
+      <span class="val" id="v_k">0.100</span>
     </div>
     <div class="row">
       <label>gravity</label>
@@ -432,6 +437,7 @@ uniform float u_m;
 uniform float u_c;        // sound speed (Tait: B = ρ₀·c²/γ)
 uniform float u_gamma;    // Tait exponent
 uniform float u_mu;       // viscosity coefficient
+uniform float u_kScorr;   // Macklin 2013 artificial-pressure strength
 uniform vec2  u_attractPos;
 uniform float u_attract;  // 0 = off, >0 = pull toward u_attractPos
 out vec4 outColor;
@@ -457,13 +463,24 @@ void process(vec4 n, vec4 nR, vec2 pos_i, vec2 vel_i,
   float rho_j = max(nR.z, 1e-6);
   float p_j   = taitPressure(rho_j, B);
 
-  // Müller symmetric pressure accel (full form, NO ρⱼ≈ρᵢ approx):
-  //   a = -Σⱼ m · (pᵢ+pⱼ)/(2·ρᵢ·ρⱼ) · ∇W_spiky
-  //     = +Σⱼ m · (pᵢ+pⱼ)/(2·ρᵢ·ρⱼ) · (30/(π·h⁵))·(h−r)² · r̂
-  // The (pᵢ+pⱼ)/2 term is what carries the pressure gradient — dropping
-  // it to pᵢ (as in v0.15/0.16) kills the interior pressure response.
-  aPres += u_m * (p_i + p_j) / (2.0 * rho_i * rho_j)
-         * spiky_c * diff * diff * dir;
+  // Macklin & Müller 2013 artificial pressure term (PBF eq. 13):
+  //   s_corr = k · (W_poly6(r,h) / W_poly6(Δq,h))^n,   Δq = 0.2·h, n = 4
+  // Acts as an always-positive repulsive pressure concentrated near r=0,
+  // which prevents the WCSPH "stuck pairs" failure mode: below-rest-density
+  // regions have p=0 under Müller's clamp, so isolated particle pairs can
+  // merge freely. s_corr pushes them apart regardless of density.
+  float h2       = h_val * h_val;
+  float dq2      = 0.04 * h2;                      // (0.2·h)²
+  float wRatio   = (h2 - rr) / max(h2 - dq2, 1e-6);  // Poly6 ratio base
+  // W_poly6 ∝ (h²-r²)³, so the ratio of W's is wRatio³.  Raise that to
+  // n=4: total power 12.
+  float wr12     = pow(wRatio, 12.0);
+  float sCorr    = u_kScorr * wr12;
+
+  // Müller symmetric pressure accel + PBF artificial pressure:
+  //   a = +Σⱼ m · [(pᵢ+pⱼ)/(2·ρᵢ·ρⱼ) + sCorr] · (30/(π·h⁵))·(h−r)² · r̂
+  float pCoef = (p_i + p_j) / (2.0 * rho_i * rho_j) + sCorr;
+  aPres += u_m * pCoef * spiky_c * diff * diff * dir;
 
   // Müller viscosity accel (proper form with ρⱼ lookup):
   //   a = μ·Σⱼ m·(vⱼ−vᵢ)/(ρᵢ·ρⱼ) · ∇²W_visc
@@ -867,6 +884,7 @@ S.params = {
   c:        0.5,     // sound speed (softer fluid)
   gamma:    7.0,     // Tait exponent
   mu:       0.02,    // low viscosity — fluid flows, not syrup
+  kScorr:   0.1,     // PBF artificial pressure (Macklin 2013, paper default)
   gravity:  1.4,
   substeps: 12,
   showBlob: 1,
@@ -969,6 +987,7 @@ bindSlider('s_h',     'v_h',     'h',        (x) => x.toFixed(4));
 bindSlider('s_c',     'v_c',     'c',        (x) => x.toFixed(1));
 bindSlider('s_g',     'v_g',     'gamma',    (x) => x.toFixed(1));
 bindSlider('s_mu',    'v_mu',    'mu',       (x) => x.toFixed(3));
+bindSlider('s_k',     'v_k',     'kScorr',   (x) => x.toFixed(3));
 bindSlider('s_grav',  'v_grav',  'gravity',  (x) => x.toFixed(2));
 bindSlider('s_subs',  'v_subs',  'substeps', (x) => x.toFixed(0));
 bindSlider('s_blob',  'v_blob',  'showBlob', (x) => x ? 'on' : 'off');
@@ -1160,6 +1179,7 @@ function step(dt) {
   gl.uniform1f(P.update.U('u_c'),     PR.c);
   gl.uniform1f(P.update.U('u_gamma'), PR.gamma);
   gl.uniform1f(P.update.U('u_mu'),    PR.mu);
+  gl.uniform1f(P.update.U('u_kScorr'),PR.kScorr);
   gl.uniform2f(P.update.U('u_attractPos'), PR.attractX, PR.attractY);
   gl.uniform1f(P.update.U('u_attract'),    PR.attract);
   gl.bindVertexArray(S.quadVAO);
