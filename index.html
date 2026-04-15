@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.17 (Müller symm)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.18 (clean WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -81,8 +81,8 @@
     </div>
     <div class="row">
       <label>viscosity μ</label>
-      <input id="s_mu" type="range" min="0" max="1" step="0.01" value="0.05">
-      <span class="val" id="v_mu">0.05</span>
+      <input id="s_mu" type="range" min="0" max="1" step="0.01" value="0.15">
+      <span class="val" id="v_mu">0.15</span>
     </div>
     <div class="row">
       <label>gravity</label>
@@ -91,8 +91,8 @@
     </div>
     <div class="row">
       <label>substeps</label>
-      <input id="s_subs" type="range" min="2" max="16" step="1" value="8">
-      <span class="val" id="v_subs">8</span>
+      <input id="s_subs" type="range" min="2" max="24" step="1" value="12">
+      <span class="val" id="v_subs">12</span>
     </div>
     <div class="row">
       <label>show fluid</label>
@@ -443,7 +443,7 @@ void process(vec4 n, vec4 nR, vec2 pos_i, vec2 vel_i,
   vec2 r = pos_i - n.xy;
   float rr = dot(r, r);
   float h2 = h_val * h_val;
-  if (rr >= h2 || rr < 1e-12) return;
+  if (rr >= h2 || rr < 1e-20) return;
   float rLen = sqrt(rr);
   float diff = h_val - rLen;
   vec2 dir = r / rLen;  // unit vector from j to i
@@ -510,13 +510,16 @@ void main() {
   vel += u_dt * (aPres + aVisc + u_gravity);
   vec2 newPos = pos + u_dt * vel;
 
-  // Walls — reflection with restitution.
+  // Walls — dissipative (normal vel → 0, not reflected).  Standard SPH
+  // practice; full reflection with restitution continuously pumps
+  // kinetic energy back into the sim as gravity re-accelerates particles
+  // into the wall, and viscosity can't dissipate it fast enough → the
+  // "violent jiggle" the user was seeing.
   float pad = 0.005;
-  float rest = 0.5;
-  if (newPos.x < pad)       { newPos.x = pad;       vel.x =  abs(vel.x) * rest; }
-  if (newPos.x > 1.0 - pad) { newPos.x = 1.0 - pad; vel.x = -abs(vel.x) * rest; }
-  if (newPos.y < pad)       { newPos.y = pad;       vel.y =  abs(vel.y) * rest; }
-  if (newPos.y > 1.0 - pad) { newPos.y = 1.0 - pad; vel.y = -abs(vel.y) * rest; }
+  if (newPos.x < pad)       { newPos.x = pad;       vel.x = max(vel.x, 0.0); }
+  if (newPos.x > 1.0 - pad) { newPos.x = 1.0 - pad; vel.x = min(vel.x, 0.0); }
+  if (newPos.y < pad)       { newPos.y = pad;       vel.y = max(vel.y, 0.0); }
+  if (newPos.y > 1.0 - pad) { newPos.y = 1.0 - pad; vel.y = min(vel.y, 0.0); }
 
   // Painted collision mask.
   float mask = texture(u_collision, newPos).r;
@@ -837,9 +840,9 @@ S.params = {
   h:        0.045,   // auto-set as 3/√N on particle-count change
   c:        4.0,     // sound speed  (B = ρ₀·c²/γ)
   gamma:    7.0,     // Tait exponent (7 = Müller water)
-  mu:       0.05,    // Müller viscosity coefficient
+  mu:       0.15,    // Müller viscosity coefficient
   gravity:  1.4,
-  substeps: 8,       // need ≥ 8 for CFL safety at c=4, h≈0.045
+  substeps: 12,      // need ≥ 12 for CFL margin during transient compression
   showBlob: 1,
   showPts:  1,
 };
