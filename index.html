@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.19 (clean WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.20<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p<br><span style="opacity:0.65">L draw · M attract · R erase</span></div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -51,28 +51,28 @@
     <div class="row">
       <label>particles</label>
       <select id="s_count">
-        <option value="32">1,024 (32²)</option>
+        <option value="32" selected>1,024 (32²)</option>
         <option value="64">4,096 (64²)</option>
-        <option value="128" selected>16,384 (128²)</option>
+        <option value="128">16,384 (128²)</option>
         <option value="192">36,864 (192²)</option>
         <option value="256">65,536 (256²)</option>
       </select>
-      <span class="val" id="v_count">128²</span>
+      <span class="val" id="v_count">32²</span>
     </div>
     <div class="row">
       <label>splat px</label>
-      <input id="s_splat" type="range" min="2" max="28" step="1" value="10">
-      <span class="val" id="v_splat">10</span>
+      <input id="s_splat" type="range" min="2" max="28" step="1" value="14">
+      <span class="val" id="v_splat">14</span>
     </div>
     <div class="row">
       <label>kernel h</label>
-      <input id="s_h" type="range" min="0.015" max="0.15" step="0.0005" value="0.045">
-      <span class="val" id="v_h">0.045</span>
+      <input id="s_h" type="range" min="0.015" max="0.25" step="0.0005" value="0.18">
+      <span class="val" id="v_h">0.1800</span>
     </div>
     <div class="row">
       <label>sound c</label>
-      <input id="s_c" type="range" min="0.5" max="20" step="0.1" value="4">
-      <span class="val" id="v_c">4.0</span>
+      <input id="s_c" type="range" min="0.1" max="20" step="0.1" value="0.5">
+      <span class="val" id="v_c">0.5</span>
     </div>
     <div class="row">
       <label>Tait γ</label>
@@ -81,8 +81,8 @@
     </div>
     <div class="row">
       <label>viscosity μ</label>
-      <input id="s_mu" type="range" min="0" max="1" step="0.01" value="0.15">
-      <span class="val" id="v_mu">0.15</span>
+      <input id="s_mu" type="range" min="0" max="1" step="0.01" value="0.02">
+      <span class="val" id="v_mu">0.02</span>
     </div>
     <div class="row">
       <label>gravity</label>
@@ -432,6 +432,8 @@ uniform float u_m;
 uniform float u_c;        // sound speed (Tait: B = ρ₀·c²/γ)
 uniform float u_gamma;    // Tait exponent
 uniform float u_mu;       // viscosity coefficient
+uniform vec2  u_attractPos;
+uniform float u_attract;  // 0 = off, >0 = pull toward u_attractPos
 out vec4 outColor;
 
 float taitPressure(float rho, float B) {
@@ -509,8 +511,16 @@ void main() {
     }
   }
 
+  // External acceleration: gravity + optional mouse-attract.
+  vec2 aExt = u_gravity;
+  if (u_attract > 0.0) {
+    vec2 toMouse = u_attractPos - pos;
+    float d = length(toMouse) + 1e-4;
+    aExt += u_attract * toMouse / d;   // constant-magnitude pull
+  }
+
   // Symplectic Euler.
-  vel += u_dt * (aPres + aVisc + u_gravity);
+  vel += u_dt * (aPres + aVisc + aExt);
   vec2 newPos = pos + u_dt * vel;
 
   // Walls — dissipative (normal vel → 0, not reflected).  Standard SPH
@@ -730,19 +740,30 @@ S.collisionFBO = makeFBO(S.collisionTex);
 // of a particle being lost because another from the same cell+slot
 // overwrote it. NEAREST filtering because we want the exact cell value.
 S.K_HASH = 4;
-S.GRID_HASH = 64;
+// Hash grid scales as N_SIDE/2 so each cell holds ~4 particles on average
+// at any N, and a 7x7 search covers h up to 3.5·cell_size = 7/N_SIDE. This
+// gives h-headroom of 0.22 @ N=1024, 0.055 @ N=16k, etc. — enough slack
+// for user tuning at any particle count.
+S.GRID_HASH = Math.max(8, Math.floor(S.N_SIDE / 2));
 S.hashTex = [];      // (pos.xy, vel.xy) per slot
 S.hashFBO = [];
 S.hashRhoTex = [];   // (pos.xy, ρⱼ, 0) per slot — filled after density pass
 S.hashRhoFBO = [];
-for (let i = 0; i < S.K_HASH; i++) {
-  const t = makeTex(S.GRID_HASH, S.GRID_HASH, gl.RGBA32F, gl.RGBA, gl.FLOAT, null, false);
-  S.hashTex.push(t);
-  S.hashFBO.push(makeFBO(t));
-  const tR = makeTex(S.GRID_HASH, S.GRID_HASH, gl.RGBA32F, gl.RGBA, gl.FLOAT, null, false);
-  S.hashRhoTex.push(tR);
-  S.hashRhoFBO.push(makeFBO(tR));
+function allocHashSet() {
+  for (const t of S.hashTex)    gl.deleteTexture(t);
+  for (const f of S.hashFBO)    gl.deleteFramebuffer(f);
+  for (const t of S.hashRhoTex) gl.deleteTexture(t);
+  for (const f of S.hashRhoFBO) gl.deleteFramebuffer(f);
+  S.hashTex = []; S.hashFBO = []; S.hashRhoTex = []; S.hashRhoFBO = [];
+  for (let i = 0; i < S.K_HASH; i++) {
+    const t  = makeTex(S.GRID_HASH, S.GRID_HASH, gl.RGBA32F, gl.RGBA, gl.FLOAT, null, false);
+    const tR = makeTex(S.GRID_HASH, S.GRID_HASH, gl.RGBA32F, gl.RGBA, gl.FLOAT, null, false);
+    S.hashTex.push(t);     S.hashFBO.push(makeFBO(t));
+    S.hashRhoTex.push(tR); S.hashRhoFBO.push(makeFBO(tR));
+  }
 }
+allocHashSet();
+S.allocHashSet = allocHashSet;
 
 // --- Geometry ---
 S.quadVAO = gl.createVertexArray();
@@ -781,7 +802,6 @@ S.resetParticles = function () {
 // Free old GL objects so we don't leak across changes.
 S.setParticleCount = function (newSide) {
   if (newSide === S.N_SIDE) return;
-  // Drop old textures / FBOs / VAO
   for (let i = 0; i < 2; i++) {
     gl.deleteTexture(S.stateTex[i]);
     gl.deleteFramebuffer(S.stateFBO[i]);
@@ -792,6 +812,9 @@ S.setParticleCount = function (newSide) {
 
   S.N_SIDE = newSide;
   S.N = newSide * newSide;
+  // Rebuild hash grid to match new particle count.
+  S.GRID_HASH = Math.max(8, Math.floor(S.N_SIDE / 2));
+  S.allocHashSet();
   const init = initialState();
   S.stateTex = [
     makeTex(S.N_SIDE, S.N_SIDE, gl.RGBA32F, gl.RGBA, gl.FLOAT, init),
@@ -839,57 +862,85 @@ const P = S.programs;
 // controls: sound speed c, Tait exponent γ, viscosity μ, gravity,
 // substeps.  No damping/vmax/rest — removed as non-physical.
 S.params = {
-  splatPt:  10.0,    // bg blob viz only
-  h:        0.045,   // auto-set as 3/√N on particle-count change
-  c:        4.0,     // sound speed  (B = ρ₀·c²/γ)
-  gamma:    7.0,     // Tait exponent (7 = Müller water)
-  mu:       0.15,    // Müller viscosity coefficient
+  splatPt:  14.0,    // bg blob viz only
+  h:        0.18,    // bigger-than-auto kernel — smoother density, less jitter
+  c:        0.5,     // sound speed (softer fluid)
+  gamma:    7.0,     // Tait exponent
+  mu:       0.02,    // low viscosity — fluid flows, not syrup
   gravity:  1.4,
-  substeps: 12,      // need ≥ 12 for CFL margin during transient compression
+  substeps: 12,
   showBlob: 1,
   showPts:  1,
+  attract:  0.0,     // magnitude set from JS when middle mouse held
+  attractX: 0.5,
+  attractY: 0.5,
 };
 const PR = S.params;
 let cur = 0; // ping-pong index
 
-// ----- Input: pointer drawing -----
-let painting = false;
-function paintAt(uvX, uvY) {
+// ----- Input: pointer drawing + attract + erase -----
+// Mouse button semantics:
+//   0 = left  → draw walls (additive blend into collision mask)
+//   1 = mid   → attract particles toward cursor position
+//   2 = right → erase walls (reverse-subtract blend)
+// On touch devices (single button), defaults to draw.
+let mouseMode = null;  // 'draw' | 'erase' | 'attract' | null
+function paintAt(uvX, uvY, signed) {
+  // signed > 0 adds wall, signed < 0 erases. Magnitude sets stroke strength.
   gl.bindFramebuffer(gl.FRAMEBUFFER, S.collisionFBO);
   gl.viewport(0, 0, S.GRID, S.GRID);
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.ONE, gl.ONE);
+  gl.blendEquation(signed >= 0.0 ? gl.FUNC_ADD : gl.FUNC_REVERSE_SUBTRACT);
   gl.useProgram(P.paint);
   gl.uniform2f(P.paint.U('u_center'), uvX, uvY);
-  gl.uniform1f(P.paint.U('u_radius'), 0.025);
-  gl.uniform1f(P.paint.U('u_value'),  1.0);
+  gl.uniform1f(P.paint.U('u_radius'), 0.03);
+  gl.uniform1f(P.paint.U('u_value'),  Math.abs(signed));
   gl.bindVertexArray(S.quadVAO);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.blendEquation(gl.FUNC_ADD);
   gl.disable(gl.BLEND);
 }
 function eventToSimUV(e) {
   const r = S.canvas.getBoundingClientRect();
   const sx = (e.clientX - r.left) / r.width;
   const sy = (e.clientY - r.top)  / r.height;
-  // canvas NDC -> sim UV using current letterbox aspect
   const ax = S.aspect[0], ay = S.aspect[1];
   let nx = (sx * 2 - 1) / ax;
   let ny = (-(sy * 2 - 1)) / ay;
   if (nx < -1 || nx > 1 || ny < -1 || ny > 1) return null;
   return [nx * 0.5 + 0.5, ny * 0.5 + 0.5];
 }
+S.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 S.canvas.addEventListener('pointerdown', (e) => {
-  painting = true;
+  e.preventDefault();
+  const uv = eventToSimUV(e); if (!uv) return;
   S.canvas.setPointerCapture(e.pointerId);
-  const uv = eventToSimUV(e); if (uv) paintAt(uv[0], uv[1]);
+  if (e.button === 1) {
+    mouseMode = 'attract';
+    PR.attractX = uv[0]; PR.attractY = uv[1]; PR.attract = 5.0;
+  } else if (e.button === 2) {
+    mouseMode = 'erase';
+    paintAt(uv[0], uv[1], -1.0);
+  } else {
+    mouseMode = 'draw';
+    paintAt(uv[0], uv[1], 1.0);
+  }
 });
 S.canvas.addEventListener('pointermove', (e) => {
-  if (!painting) return;
-  const uv = eventToSimUV(e); if (uv) paintAt(uv[0], uv[1]);
+  if (!mouseMode) return;
+  const uv = eventToSimUV(e); if (!uv) return;
+  if      (mouseMode === 'draw')    paintAt(uv[0], uv[1],  1.0);
+  else if (mouseMode === 'erase')   paintAt(uv[0], uv[1], -1.0);
+  else if (mouseMode === 'attract') { PR.attractX = uv[0]; PR.attractY = uv[1]; }
 });
-function endPaint(e) { painting = false; try { S.canvas.releasePointerCapture(e.pointerId); } catch (_){} }
-S.canvas.addEventListener('pointerup', endPaint);
-S.canvas.addEventListener('pointercancel', endPaint);
+function endPointer(e) {
+  mouseMode = null;
+  PR.attract = 0.0;
+  try { S.canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+}
+S.canvas.addEventListener('pointerup', endPointer);
+S.canvas.addEventListener('pointercancel', endPointer);
 
 // ----- Buttons -----
 document.getElementById('reset').addEventListener('click', () => S.resetParticles());
@@ -925,24 +976,11 @@ bindSlider('s_pts',   'v_pts',   'showPts',  (x) => x ? 'on' : 'off');
 
 const countSel = document.getElementById('s_count');
 const countVal = document.getElementById('v_count');
-function autoTuneH() {
-  // Canonical SPH tuning: h ≈ 3/√N gives ~28 neighbours in 2D, matching
-  // Müller's target of ~30-40 neighbours for a well-conditioned density
-  // estimate. Under, particles have too few neighbours (noisy ρ).  Over,
-  // kernel support is huge and the sim is slow + blurry.
-  const auto = Math.max(0.015, Math.min(0.15, 3.0 / Math.sqrt(S.N)));
-  PR.h = auto;
-  const el = document.getElementById('s_h');
-  const v  = document.getElementById('v_h');
-  if (el) el.value = auto;
-  if (v)  v.textContent = auto.toFixed(4);
-}
 function applyCount() {
   const n = parseInt(countSel.value, 10);
   S.setParticleCount(n);
   countVal.textContent = n + '²';
   document.getElementById('np').textContent = (n*n).toLocaleString();
-  autoTuneH();
 }
 countSel.addEventListener('change', applyCount);
 applyCount();
@@ -1122,6 +1160,8 @@ function step(dt) {
   gl.uniform1f(P.update.U('u_c'),     PR.c);
   gl.uniform1f(P.update.U('u_gamma'), PR.gamma);
   gl.uniform1f(P.update.U('u_mu'),    PR.mu);
+  gl.uniform2f(P.update.U('u_attractPos'), PR.attractX, PR.attractY);
+  gl.uniform1f(P.update.U('u_attract'),    PR.attract);
   gl.bindVertexArray(S.quadVAO);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   cur = nxt;
