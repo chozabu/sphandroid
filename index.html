@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.12 (Müller WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.13 (Tait WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -370,12 +370,19 @@ void main() {
                              vec2(12.9898, 78.233))) * 43758.5453);
   vec2 sbDir = normalize(vec2(rh1, rh2) - 0.5 + vec2(1e-3, 0.0));
 
-  // Müller WCSPH: pressure scales with how compressed we are vs rest.
-  // Force per pair already absorbs Spiky gradient magnitude in (h-r)^2
-  // and uses own density for ρ_j (Müller's standard approximation).
+  // Weakly-Compressible SPH with a Tait-style equation of state (Becker
+  // & Teschner 2007). pressure ramps up as (ρ/ρ₀)^γ so modest
+  // compression produces a large restoring force — prevents collapse.
+  // We DON'T divide by ρ² here because our kernel is unnormalized
+  // (skipping the Müller spiky-gradient constant of 45/(π·h⁶) absorbs
+  // into u_stiff). Dividing by ρ² on top makes force ~1000× too weak.
+  // clamped to 0 below rest (no tensile forces → no pairing instability).
   float density = texture(u_density, pos).r;
-  float pressure = max(density - u_rest, 0.0);
-  float pscale = u_stiff * pressure / max(density * density, 1.0);
+  float dRatio  = density / max(u_rest, 0.001);
+  float pressure = (dRatio > 1.0)
+      ? u_stiff * (dRatio*dRatio*dRatio - 1.0)
+      : 0.0;
+  float pscale = pressure;
 
   vec2 posCl = clamp(pos, 1e-4, 1.0 - 1e-4);
   vec2 cell = floor(posCl * u_gridHash);
@@ -398,7 +405,8 @@ void main() {
   }
 
   // Symmetry-breaking kick when nothing visible nearby (anti-collapse).
-  float sbStrength = smoothstep(0.08, 0.0, visW);
+  // NOTE: smoothstep requires edge0 < edge1 — had them reversed (UB) before.
+  float sbStrength = 1.0 - smoothstep(0.0, 0.08, visW);
   force += sbDir * sbStrength * max(u_stiff, 100.0) * u_h * u_h * 2.0;
 
   if (visW > 1e-6) {
@@ -716,10 +724,10 @@ const P = S.programs;
 // Live-tunable params. MUST be declared before any panel-binding code
 // runs, or the slider apply() callbacks hit a temporal dead zone.
 S.params = {
-  splatPt: 10.0,    // density-splat kernel size (now used by both physics & viz)
-  rest:    8.0,     // rest density ρ₀ (Müller WCSPH)
+  splatPt: 10.0,    // density-splat kernel size (used by both physics & viz)
+  rest:    6.0,     // rest density ρ₀ (auto-tuned when N changes)
   h:       0.045,   // SPH kernel support radius (sim units)
-  stiff:   60.0,    // pressure stiffness k (Müller p = k·(ρ−ρ₀))
+  stiff:   100.0,   // Tait stiffness (p = stiff · ((ρ/ρ₀)³ − 1))
   xsph:    0.05,    // pairwise viscosity blend per substep
   damping: 0.998,
   gravity: 1.4,
@@ -804,11 +812,22 @@ bindSlider('s_pts',   'v_pts',   'showPts',  (x) => x ? 'on' : 'off');
 
 const countSel = document.getElementById('s_count');
 const countVal = document.getElementById('v_count');
+function autoTuneRest() {
+  // Avg density per cell (grid=128, point_size=10, cubic-Hermite kernel)
+  // is empirically ~0.00143 · N for uniformly-distributed particles.
+  const auto = Math.max(0.5, Math.round(S.N * 0.00143 * 10) / 10);
+  PR.rest = auto;
+  const el = document.getElementById('s_rest');
+  const v  = document.getElementById('v_rest');
+  if (el) el.value = auto;
+  if (v)  v.textContent = auto.toFixed(1);
+}
 function applyCount() {
   const n = parseInt(countSel.value, 10);
   S.setParticleCount(n);
   countVal.textContent = n + '²';
   document.getElementById('np').textContent = (n*n).toLocaleString();
+  autoTuneRest();
 }
 countSel.addEventListener('change', applyCount);
 applyCount();
