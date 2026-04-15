@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.18 (clean WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.19 (clean WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -293,7 +293,7 @@ void addPair(vec4 n, vec2 pos, float h2, inout float rho) {
   if (n.x < -0.5) return;
   vec2 r = pos - n.xy;
   float rr = dot(r, r);
-  if (rr >= h2 || rr < 1e-12) return;
+  if (rr >= h2 || rr < 1e-20) return;
   float diff = h2 - rr;
   rho += diff * diff * diff;  // unnormalised (h²-r²)³
 }
@@ -305,8 +305,11 @@ void main() {
   vec2 cell = floor(posCl * u_gridHash);
   float h2 = u_h * u_h;
   float rho = 0.0;
-  for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
+  // 7x7 search covers h up to ~3.5·cell_size.  Default h_auto = 3/√N
+  // gives h/cell ≈ 3 at any N if GRID_HASH = N_SIDE, so we need enough
+  // slack to catch cardinal-direction neighbours at the very edge of h.
+  for (int dy = -3; dy <= 3; dy++) {
+    for (int dx = -3; dx <= 3; dx++) {
       vec2 nCell = cell + vec2(float(dx), float(dy));
       if (nCell.x < 0.0 || nCell.x >= u_gridHash ||
           nCell.y < 0.0 || nCell.y >= u_gridHash) continue;
@@ -489,8 +492,8 @@ void main() {
   vec2 aPres = vec2(0.0);
   vec2 aVisc = vec2(0.0);
 
-  for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
+  for (int dy = -3; dy <= 3; dy++) {
+    for (int dx = -3; dx <= 3; dx++) {
       vec2 nCell = cell + vec2(float(dx), float(dy));
       if (nCell.x < 0.0 || nCell.x >= u_gridHash ||
           nCell.y < 0.0 || nCell.y >= u_gridHash) continue;
