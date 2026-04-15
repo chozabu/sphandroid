@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.11 (real SPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.12 (Müller WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -66,8 +66,8 @@
     </div>
     <div class="row">
       <label>rest density</label>
-      <input id="s_rest" type="range" min="1" max="80" step="0.5" value="22">
-      <span class="val" id="v_rest">22</span>
+      <input id="s_rest" type="range" min="0.5" max="80" step="0.5" value="8">
+      <span class="val" id="v_rest">8</span>
     </div>
     <div class="row">
       <label>kernel h</label>
@@ -76,8 +76,8 @@
     </div>
     <div class="row">
       <label>stiffness</label>
-      <input id="s_stiff" type="range" min="1" max="4000" step="1" value="400">
-      <span class="val" id="v_stiff">400</span>
+      <input id="s_stiff" type="range" min="1" max="2000" step="1" value="60">
+      <span class="val" id="v_stiff">60</span>
     </div>
     <div class="row">
       <label>viscosity</label>
@@ -86,13 +86,18 @@
     </div>
     <div class="row">
       <label>damping</label>
-      <input id="s_damp" type="range" min="0.95" max="1" step="0.001" value="0.997">
-      <span class="val" id="v_damp">0.997</span>
+      <input id="s_damp" type="range" min="0.95" max="1" step="0.001" value="0.998">
+      <span class="val" id="v_damp">0.998</span>
     </div>
     <div class="row">
       <label>gravity</label>
       <input id="s_grav" type="range" min="0" max="4" step="0.05" value="1.4">
       <span class="val" id="v_grav">1.40</span>
+    </div>
+    <div class="row">
+      <label>v cap</label>
+      <input id="s_vmax" type="range" min="0.5" max="10" step="0.1" value="2">
+      <span class="val" id="v_vmax">2.0</span>
     </div>
     <div class="row">
       <label>show fluid</label>
@@ -311,12 +316,12 @@ void main() {
   outColor = vec4(force, dc, 1.0);
 }`;
 
-// Particle update pass (real SPH with spatial-hash neighbour search).
-// For each particle we iterate a 5x5 window of hash cells across K=4
-// hash slots and, for every stored neighbour within radius u_h, add a
-// pairwise spiky-gradient repulsion + XSPH viscosity contribution.
-// Because each pair is evaluated directly (no density-grid smoothing),
-// coincident and sub-pixel-close particles DO feel each other.
+// Particle update pass (real SPH, Müller-2003-style WCSPH).
+//   ρ_i sampled from the density grid (built by the splat pass).
+//   p_i = k · max(ρ_i − ρ₀, 0)                  (clamped Tait-ish)
+//   per-pair force ∝ (p_i / ρ_i²) · ∇W_spiky    (Müller force, using own
+//                                                 density as proxy for ρ_j)
+//   vel + dt·(force + g),  damping,  XSPH,  velocity cap (CFL safety).
 S.FS_UPDATE = `#version 300 es
 precision highp float;
 in vec2 v_uv;
@@ -325,31 +330,31 @@ uniform sampler2D u_hash0;
 uniform sampler2D u_hash1;
 uniform sampler2D u_hash2;
 uniform sampler2D u_hash3;
+uniform sampler2D u_density;
 uniform sampler2D u_collision;
 uniform vec2  u_gravity;
 uniform float u_dt;
 uniform float u_gridHash;
 uniform float u_gridColl;
 uniform float u_damping;
-uniform float u_h;        // SPH support radius, in sim units
-uniform float u_stiff;    // pairwise repulsion strength
-uniform float u_xsph;     // 0..1 viscosity blend strength
+uniform float u_h;
+uniform float u_rest;
+uniform float u_stiff;
+uniform float u_xsph;
+uniform float u_vmax;
 out vec4 outColor;
 
-void process(vec4 n, vec2 pos_i, vec2 vel_i,
+void process(vec4 n, vec2 pos_i, vec2 vel_i, float pscale,
              inout vec2 force, inout vec2 visSum, inout float visW) {
-  // -10 sentinel = empty hash cell
   if (n.x < -0.5) return;
   vec2 r = pos_i - n.xy;
   float rr = dot(r, r);
   float h2 = u_h * u_h;
-  if (rr >= h2 || rr < 1e-12) return;  // out of range or self
+  if (rr >= h2 || rr < 1e-12) return;
   float rLen = sqrt(rr);
   float diff = u_h - rLen;
-  // Spiky-style pairwise repulsion: strongest at close approach,
-  // smooth zero at the boundary.
-  force += u_stiff * diff * diff * (r / rLen);
-  // Pairwise XSPH viscosity (kernel-weighted neighbour velocity average).
+  // Spiky-gradient direction × Müller's pressure/density² scaling.
+  force += pscale * diff * diff * (r / rLen);
   visSum += n.zw * diff;
   visW   += diff;
 }
@@ -359,12 +364,18 @@ void main() {
   vec2 pos = s.xy;
   vec2 vel = s.zw;
 
-  // Per-particle unique direction, used below to break symmetry when
-  // this particle is in a collapsed cluster (no visible neighbours).
+  // Per-particle unique direction for symmetry-breaking when stuck.
   float rh1 = fract(sin(dot(v_uv, vec2(12.9898, 78.233))) * 43758.5453);
   float rh2 = fract(sin(dot(v_uv + vec2(3.71, 1.93),
                              vec2(12.9898, 78.233))) * 43758.5453);
   vec2 sbDir = normalize(vec2(rh1, rh2) - 0.5 + vec2(1e-3, 0.0));
+
+  // Müller WCSPH: pressure scales with how compressed we are vs rest.
+  // Force per pair already absorbs Spiky gradient magnitude in (h-r)^2
+  // and uses own density for ρ_j (Müller's standard approximation).
+  float density = texture(u_density, pos).r;
+  float pressure = max(density - u_rest, 0.0);
+  float pscale = u_stiff * pressure / max(density * density, 1.0);
 
   vec2 posCl = clamp(pos, 1e-4, 1.0 - 1e-4);
   vec2 cell = floor(posCl * u_gridHash);
@@ -379,21 +390,16 @@ void main() {
       if (nCell.x < 0.0 || nCell.x >= u_gridHash ||
           nCell.y < 0.0 || nCell.y >= u_gridHash) continue;
       vec2 cellUV = (nCell + 0.5) / u_gridHash;
-      process(texture(u_hash0, cellUV), pos, vel, force, visSum, visW);
-      process(texture(u_hash1, cellUV), pos, vel, force, visSum, visW);
-      process(texture(u_hash2, cellUV), pos, vel, force, visSum, visW);
-      process(texture(u_hash3, cellUV), pos, vel, force, visSum, visW);
+      process(texture(u_hash0, cellUV), pos, vel, pscale, force, visSum, visW);
+      process(texture(u_hash1, cellUV), pos, vel, pscale, force, visSum, visW);
+      process(texture(u_hash2, cellUV), pos, vel, pscale, force, visSum, visW);
+      process(texture(u_hash3, cellUV), pos, vel, pscale, force, visSum, visW);
     }
   }
 
-  // Symmetry-breaking anti-collapse kick. When a particle can't find
-  // any valid non-coincident neighbour (visW ≈ 0), it's almost
-  // certainly inside a dense cluster where hash-slot collisions have
-  // hidden everyone else. Push it along its own unique direction so
-  // two stuck particles (with different sbDir) escape each other.
-  // Fades out smoothly as real neighbours re-appear.
+  // Symmetry-breaking kick when nothing visible nearby (anti-collapse).
   float sbStrength = smoothstep(0.08, 0.0, visW);
-  force += sbDir * sbStrength * u_stiff * u_h * u_h * 2.0;
+  force += sbDir * sbStrength * max(u_stiff, 100.0) * u_h * u_h * 2.0;
 
   if (visW > 1e-6) {
     vec2 avgVel = visSum / visW;
@@ -403,14 +409,19 @@ void main() {
   vel += u_dt * (force + u_gravity);
   vel *= u_damping;
 
+  // CFL-style velocity cap so a big single-frame impulse can't shoot a
+  // particle through the wall + back across the sim ("fired off top").
+  float vMag = length(vel);
+  if (vMag > u_vmax) vel *= u_vmax / vMag;
+
   vec2 newPos = pos + u_dt * vel;
 
   // Walls
   float pad = 0.005;
-  if (newPos.x < pad)       { newPos.x = pad;       vel.x =  abs(vel.x) * 0.35; }
-  if (newPos.x > 1.0 - pad) { newPos.x = 1.0 - pad; vel.x = -abs(vel.x) * 0.35; }
-  if (newPos.y < pad)       { newPos.y = pad;       vel.y =  abs(vel.y) * 0.35; }
-  if (newPos.y > 1.0 - pad) { newPos.y = 1.0 - pad; vel.y = -abs(vel.y) * 0.35; }
+  if (newPos.x < pad)       { newPos.x = pad;       vel.x =  abs(vel.x) * 0.5; }
+  if (newPos.x > 1.0 - pad) { newPos.x = 1.0 - pad; vel.x = -abs(vel.x) * 0.5; }
+  if (newPos.y < pad)       { newPos.y = pad;       vel.y =  abs(vel.y) * 0.5; }
+  if (newPos.y > 1.0 - pad) { newPos.y = 1.0 - pad; vel.y = -abs(vel.y) * 0.5; }
 
   // Collision mask
   float mask = texture(u_collision, newPos).r;
@@ -425,7 +436,7 @@ void main() {
     if (nl > 1e-4) {
       nrm /= nl;
       newPos = pos + nrm * 0.003;
-      vel = reflect(vel, nrm) * 0.4;
+      vel = reflect(vel, nrm) * 0.5;
     } else {
       newPos = pos;
       vel *= -0.3;
@@ -705,13 +716,14 @@ const P = S.programs;
 // Live-tunable params. MUST be declared before any panel-binding code
 // runs, or the slider apply() callbacks hit a temporal dead zone.
 S.params = {
-  splatPt: 10.0,    // only affects the visual-only bg density blob now
-  rest:    22.0,    // ditto (used by bg shader for blob threshold)
+  splatPt: 10.0,    // density-splat kernel size (now used by both physics & viz)
+  rest:    8.0,     // rest density ρ₀ (Müller WCSPH)
   h:       0.045,   // SPH kernel support radius (sim units)
-  stiff:   400.0,   // pairwise repulsion strength
-  xsph:    0.05,    // pairwise viscosity blend per substep (0..1)
-  damping: 0.997,
+  stiff:   60.0,    // pressure stiffness k (Müller p = k·(ρ−ρ₀))
+  xsph:    0.05,    // pairwise viscosity blend per substep
+  damping: 0.998,
   gravity: 1.4,
+  vmax:    2.0,     // CFL-style cap on per-frame velocity
   showBlob: 1,
   showPts:  1,
 };
@@ -786,6 +798,7 @@ bindSlider('s_stiff', 'v_stiff', 'stiff',    (x) => x.toFixed(0));
 bindSlider('s_xsph',  'v_xsph',  'xsph',     (x) => x.toFixed(2));
 bindSlider('s_damp',  'v_damp',  'damping',  (x) => x.toFixed(3));
 bindSlider('s_grav',  'v_grav',  'gravity',  (x) => x.toFixed(2));
+bindSlider('s_vmax',  'v_vmax',  'vmax',     (x) => x.toFixed(1));
 bindSlider('s_blob',  'v_blob',  'showBlob', (x) => x ? 'on' : 'off');
 bindSlider('s_pts',   'v_pts',   'showPts',  (x) => x ? 'on' : 'off');
 
@@ -914,14 +927,18 @@ function step(dt) {
   gl.uniform1i(P.update.U('u_hash3'), 4);
   gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, S.collisionTex);
   gl.uniform1i(P.update.U('u_collision'), 5);
+  gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, S.densityTex);
+  gl.uniform1i(P.update.U('u_density'), 6);
   gl.uniform2f(P.update.U('u_gravity'), gx, gy);
   gl.uniform1f(P.update.U('u_dt'), dt);
   gl.uniform1f(P.update.U('u_gridHash'), S.GRID_HASH);
   gl.uniform1f(P.update.U('u_gridColl'), S.GRID);
   gl.uniform1f(P.update.U('u_damping'), PR.damping);
   gl.uniform1f(P.update.U('u_h'),     PR.h);
+  gl.uniform1f(P.update.U('u_rest'),  PR.rest);
   gl.uniform1f(P.update.U('u_stiff'), PR.stiff);
   gl.uniform1f(P.update.U('u_xsph'),  PR.xsph);
+  gl.uniform1f(P.update.U('u_vmax'),  PR.vmax);
   gl.bindVertexArray(S.quadVAO);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   cur = nxt;
