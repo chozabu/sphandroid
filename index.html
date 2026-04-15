@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div class="hud" id="hud">GPU SPH Fluid v0.16 (clean WCSPH)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
+<div class="hud" id="hud">GPU SPH Fluid v0.17 (Müller symm)<br><span id="fps">--</span> fps &middot; <span id="np">--</span> p</div>
 <div class="btns">
   <button id="reset">Reset</button>
   <button id="clearC">Clear walls</button>
@@ -236,6 +236,40 @@ void main() {
   outColor = v_state;
 }`;
 
+// Second hash-build vertex: stores (pos.xy, ρᵢ, 0) instead of (pos, vel).
+// Needed so the force pass can read ρⱼ per neighbour and use the full
+// Müller symmetric pressure formula a = -Σⱼ m·(pᵢ+pⱼ)/(2·ρᵢ·ρⱼ)·∇W.
+// Using pⱼ ≈ pᵢ drops the sum to a constant × Σ∇W, which is identically
+// zero for isotropic neighbourhoods — the pressure gradient vanishes in
+// the pile interior and only the free surface feels any force.
+S.VS_HASH_RHO = `#version 300 es
+layout(location=0) in float a_index;
+uniform sampler2D u_state;
+uniform sampler2D u_rho;
+uniform float u_nside;
+uniform float u_gridHash;
+uniform int u_K;
+uniform int u_slot;
+flat out vec4 v_state;
+void main() {
+  int idxI = int(a_index + 0.5);
+  float idxF = float(idxI);
+  vec2 uv = (vec2(mod(idxF, u_nside), floor(idxF / u_nside)) + 0.5) / u_nside;
+  vec4 s = texture(u_state, uv);
+  float rho_i = texture(u_rho, uv).r;
+  v_state = vec4(s.xy, rho_i, 0.0);
+  if ((idxI - (idxI / u_K) * u_K) != u_slot) {
+    gl_Position = vec4(-10.0, -10.0, 0.0, 1.0);
+    gl_PointSize = 1.0;
+    return;
+  }
+  vec2 pos = clamp(s.xy, 1e-4, 1.0 - 1e-4);
+  vec2 cell = floor(pos * u_gridHash);
+  vec2 cellUV = (cell + 0.5) / u_gridHash;
+  gl_Position = vec4(cellUV * 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = 1.0;
+}`;
+
 // Per-particle density pass: for each particle i, sums the 2D Poly6
 // kernel W(r_ij, h) = (4/(π·h⁸))·(h²−r²)³ over its hash neighbours.
 // Gives the proper SPH density field that the pressure solver needs.
@@ -381,6 +415,10 @@ uniform sampler2D u_hash0;
 uniform sampler2D u_hash1;
 uniform sampler2D u_hash2;
 uniform sampler2D u_hash3;
+uniform sampler2D u_hashR0;
+uniform sampler2D u_hashR1;
+uniform sampler2D u_hashR2;
+uniform sampler2D u_hashR3;
 uniform sampler2D u_collision;
 uniform vec2  u_gravity;
 uniform float u_dt;
@@ -393,8 +431,12 @@ uniform float u_gamma;    // Tait exponent
 uniform float u_mu;       // viscosity coefficient
 out vec4 outColor;
 
-void process(vec4 n, vec2 pos_i, vec2 vel_i,
-             float p_i, float rho_i,
+float taitPressure(float rho, float B) {
+  return (rho > 1.0) ? B * (pow(rho, u_gamma) - 1.0) : 0.0;
+}
+
+void process(vec4 n, vec4 nR, vec2 pos_i, vec2 vel_i,
+             float p_i, float rho_i, float B,
              float spiky_c, float visc_c, float h_val,
              inout vec2 aPres, inout vec2 aVisc) {
   if (n.x < -0.5) return;
@@ -405,16 +447,22 @@ void process(vec4 n, vec2 pos_i, vec2 vel_i,
   float rLen = sqrt(rr);
   float diff = h_val - rLen;
   vec2 dir = r / rLen;  // unit vector from j to i
-  // Müller pressure accel (symmetric form with ρⱼ ≈ ρᵢ, pⱼ ≈ pᵢ):
-  //   a = m · pᵢ / ρᵢ² · |∇W_spiky| · r̂
-  //     = m · pᵢ / ρᵢ² · (30/(π·h⁵)) · (h−r)² · r̂
-  aPres += u_m * p_i / (rho_i * rho_i) * spiky_c * diff * diff * dir;
-  // Müller viscosity accel = viscosity FORCE / ρᵢ:
-  //   f = μ·m·(vⱼ−vᵢ)/ρⱼ · ∇²W_visc         (force)
-  //   a = f/ρᵢ ≈ μ·m·(vⱼ−vᵢ)/(ρᵢ·ρⱼ) · ∇²W  (accel; ρⱼ≈ρᵢ → /ρᵢ²)
-  // (v0.15 was missing one /ρ factor — correct viscosity was 1×,
-  //  compressed regions got over-damped up to ρ² times what they should.)
-  aVisc += u_mu * u_m / (rho_i * rho_i) * visc_c * diff * (n.zw - vel_i);
+
+  // Look up neighbour's density & pressure (ρ₀ = 1 baked into pressure fn).
+  float rho_j = max(nR.z, 1e-6);
+  float p_j   = taitPressure(rho_j, B);
+
+  // Müller symmetric pressure accel (full form, NO ρⱼ≈ρᵢ approx):
+  //   a = -Σⱼ m · (pᵢ+pⱼ)/(2·ρᵢ·ρⱼ) · ∇W_spiky
+  //     = +Σⱼ m · (pᵢ+pⱼ)/(2·ρᵢ·ρⱼ) · (30/(π·h⁵))·(h−r)² · r̂
+  // The (pᵢ+pⱼ)/2 term is what carries the pressure gradient — dropping
+  // it to pᵢ (as in v0.15/0.16) kills the interior pressure response.
+  aPres += u_m * (p_i + p_j) / (2.0 * rho_i * rho_j)
+         * spiky_c * diff * diff * dir;
+
+  // Müller viscosity accel (proper form with ρⱼ lookup):
+  //   a = μ·Σⱼ m·(vⱼ−vᵢ)/(ρᵢ·ρⱼ) · ∇²W_visc
+  aVisc += u_mu * u_m / (rho_i * rho_j) * visc_c * diff * (n.zw - vel_i);
 }
 
 void main() {
@@ -428,9 +476,7 @@ void main() {
   // Tait equation of state.  REST_RHO = 1 (normalised so m = 1/N gives
   // ρ ≈ 1 at uniform distribution).  Clamped ≥ 0 — no tensile forces.
   float B = u_c * u_c / u_gamma;             // ρ₀ = 1 folded in
-  float p_i = (rho_i > 1.0)
-      ? B * (pow(rho_i, u_gamma) - 1.0)
-      : 0.0;
+  float p_i = taitPressure(rho_i, B);
 
   // Kernel normalisations (2D).
   float h5 = u_h * u_h * u_h * u_h * u_h;
@@ -449,10 +495,14 @@ void main() {
       if (nCell.x < 0.0 || nCell.x >= u_gridHash ||
           nCell.y < 0.0 || nCell.y >= u_gridHash) continue;
       vec2 cellUV = (nCell + 0.5) / u_gridHash;
-      process(texture(u_hash0, cellUV), pos, vel, p_i, rho_i, spiky_c, visc_c, u_h, aPres, aVisc);
-      process(texture(u_hash1, cellUV), pos, vel, p_i, rho_i, spiky_c, visc_c, u_h, aPres, aVisc);
-      process(texture(u_hash2, cellUV), pos, vel, p_i, rho_i, spiky_c, visc_c, u_h, aPres, aVisc);
-      process(texture(u_hash3, cellUV), pos, vel, p_i, rho_i, spiky_c, visc_c, u_h, aPres, aVisc);
+      process(texture(u_hash0,  cellUV), texture(u_hashR0, cellUV),
+              pos, vel, p_i, rho_i, B, spiky_c, visc_c, u_h, aPres, aVisc);
+      process(texture(u_hash1,  cellUV), texture(u_hashR1, cellUV),
+              pos, vel, p_i, rho_i, B, spiky_c, visc_c, u_h, aPres, aVisc);
+      process(texture(u_hash2,  cellUV), texture(u_hashR2, cellUV),
+              pos, vel, p_i, rho_i, B, spiky_c, visc_c, u_h, aPres, aVisc);
+      process(texture(u_hash3,  cellUV), texture(u_hashR3, cellUV),
+              pos, vel, p_i, rho_i, B, spiky_c, visc_c, u_h, aPres, aVisc);
     }
   }
 
@@ -600,13 +650,14 @@ function link(vs, fs) {
 }
 
 S.programs = {
-  splat:   link(S.VS_SPLAT,  S.FS_SPLAT),   // bg blob viz only
-  hash:    link(S.VS_HASH,   S.FS_HASH),    // spatial-hash build
-  density: link(S.VS_QUAD,   S.FS_DENSITY), // per-particle Poly6 density
-  update:  link(S.VS_QUAD,   S.FS_UPDATE),
-  render:  link(S.VS_RENDER, S.FS_RENDER),
-  bg:      link(S.VS_QUAD,   S.FS_BG),
-  paint:   link(S.VS_QUAD,   S.FS_PAINT),
+  splat:   link(S.VS_SPLAT,    S.FS_SPLAT),   // bg blob viz only
+  hash:    link(S.VS_HASH,     S.FS_HASH),    // hash with (pos, vel)
+  hashRho: link(S.VS_HASH_RHO, S.FS_HASH),    // hash with (pos, ρ, 0)
+  density: link(S.VS_QUAD,     S.FS_DENSITY), // per-particle Poly6 density
+  update:  link(S.VS_QUAD,     S.FS_UPDATE),
+  render:  link(S.VS_RENDER,   S.FS_RENDER),
+  bg:      link(S.VS_QUAD,     S.FS_BG),
+  paint:   link(S.VS_QUAD,     S.FS_PAINT),
 };
 
 // --- Textures & FBOs ---
@@ -674,12 +725,17 @@ S.collisionFBO = makeFBO(S.collisionTex);
 // overwrote it. NEAREST filtering because we want the exact cell value.
 S.K_HASH = 4;
 S.GRID_HASH = 64;
-S.hashTex = [];
+S.hashTex = [];      // (pos.xy, vel.xy) per slot
 S.hashFBO = [];
+S.hashRhoTex = [];   // (pos.xy, ρⱼ, 0) per slot — filled after density pass
+S.hashRhoFBO = [];
 for (let i = 0; i < S.K_HASH; i++) {
   const t = makeTex(S.GRID_HASH, S.GRID_HASH, gl.RGBA32F, gl.RGBA, gl.FLOAT, null, false);
   S.hashTex.push(t);
   S.hashFBO.push(makeFBO(t));
+  const tR = makeTex(S.GRID_HASH, S.GRID_HASH, gl.RGBA32F, gl.RGBA, gl.FLOAT, null, false);
+  S.hashRhoTex.push(tR);
+  S.hashRhoFBO.push(makeFBO(tR));
 }
 
 // --- Geometry ---
@@ -1003,8 +1059,28 @@ function step(dt) {
   gl.bindVertexArray(S.quadVAO);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-  // 4) Particle update — Müller pressure + viscosity + gravity, symplectic
-  //    Euler, no hacks.
+  // 4) Build hashRho — stores (pos, ρᵢ, 0) per slot so the force pass can
+  //    read ρⱼ per neighbour and use the full Müller symmetric pressure
+  //    formula (the ρⱼ≈ρᵢ approximation killed the interior gradient).
+  for (let k = 0; k < S.K_HASH; k++) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, S.hashRhoFBO[k]);
+    gl.viewport(0, 0, S.GRID_HASH, S.GRID_HASH);
+    gl.clearColor(-10, -10, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(P.hashRho);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, S.stateTex[cur]);
+    gl.uniform1i(P.hashRho.U('u_state'), 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, S.rhoTex);
+    gl.uniform1i(P.hashRho.U('u_rho'), 1);
+    gl.uniform1f(P.hashRho.U('u_nside'), S.N_SIDE);
+    gl.uniform1f(P.hashRho.U('u_gridHash'), S.GRID_HASH);
+    gl.uniform1i(P.hashRho.U('u_K'), S.K_HASH);
+    gl.uniform1i(P.hashRho.U('u_slot'), k);
+    gl.bindVertexArray(S.idxVAO);
+    gl.drawArrays(gl.POINTS, 0, S.N);
+  }
+
+  // 5) Particle update — full Müller symmetric WCSPH.
   const nxt = 1 - cur;
   gl.bindFramebuffer(gl.FRAMEBUFFER, S.stateFBO[nxt]);
   gl.viewport(0, 0, S.N_SIDE, S.N_SIDE);
@@ -1023,6 +1099,14 @@ function step(dt) {
   gl.uniform1i(P.update.U('u_hash3'), 5);
   gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, S.collisionTex);
   gl.uniform1i(P.update.U('u_collision'), 6);
+  gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, S.hashRhoTex[0]);
+  gl.uniform1i(P.update.U('u_hashR0'), 7);
+  gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_2D, S.hashRhoTex[1]);
+  gl.uniform1i(P.update.U('u_hashR1'), 8);
+  gl.activeTexture(gl.TEXTURE9); gl.bindTexture(gl.TEXTURE_2D, S.hashRhoTex[2]);
+  gl.uniform1i(P.update.U('u_hashR2'), 9);
+  gl.activeTexture(gl.TEXTURE10); gl.bindTexture(gl.TEXTURE_2D, S.hashRhoTex[3]);
+  gl.uniform1i(P.update.U('u_hashR3'), 10);
   gl.uniform2f(P.update.U('u_gravity'), gx, gy);
   gl.uniform1f(P.update.U('u_dt'), dt);
   gl.uniform1f(P.update.U('u_gridHash'), S.GRID_HASH);
